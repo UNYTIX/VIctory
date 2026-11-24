@@ -175,6 +175,45 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// `VICTORY_RT_MISS=1`: every ray-tracing node test
+/// (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) returns "no
+/// node hit" (`0xffffffff` in its four results) without reading the node,
+/// so every traversal ends at once as a miss: each ray sees the sky.
+///
+/// A fallback for runs without the title's structure builder (off unless
+/// `VICTORY_BVH_BUILDER=1`): the trace programs run anyway and otherwise
+/// walk structures nothing built. So it is ignored when the builder is
+/// asked for. Off by default.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn rt_miss() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_RT_MISS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_rt_miss(
+            std::env::var("VICTORY_RT_MISS").ok().as_deref(),
+            std::env::var("VICTORY_BVH_BUILDER").ok().as_deref(),
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' setting of [`rt_miss`] for this thread (the card tests
+    /// run in parallel; the switch is read once per process otherwise).
+    pub(crate) static TEST_RT_MISS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_RT_MISS` and `VICTORY_BVH_BUILDER`'s values: on only for
+/// `VICTORY_RT_MISS=1` without `VICTORY_BVH_BUILDER=1`. Pure, for testing.
+fn parse_rt_miss(rt_miss: Option<&str>, builder: Option<&str>) -> bool {
+    rt_miss.map(str::trim) == Some("1") && builder.map(str::trim) != Some("1")
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -748,6 +787,16 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn rt_miss_is_on_only_for_1_and_never_with_the_builder() {
+        assert!(!super::parse_rt_miss(None, None));
+        assert!(super::parse_rt_miss(Some("1"), None));
+        assert!(super::parse_rt_miss(Some(" 1 "), Some("0")));
+        assert!(!super::parse_rt_miss(Some("0"), None));
+        assert!(!super::parse_rt_miss(Some("yes"), None));
+        assert!(!super::parse_rt_miss(Some("1"), Some("1")));
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
