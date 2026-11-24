@@ -557,6 +557,23 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
+            // VIcky (local): `VICTORY_DEBUG_PSO=<hash>,<hash>` logs the whole
+            // blend state and target formats of the pipelines with that shader.
+            if let Ok(only) = std::env::var("VICTORY_DEBUG_PSO") {
+                let named = format!("{shaders:?}");
+                if only.split(',').any(|h| !h.trim().is_empty() && named.contains(h.trim())) {
+                    let n = g.targets.NumRenderTargets.min(8) as usize;
+                    tracing::info!(
+                        ?shaders,
+                        alpha_to_coverage = g.blend.AlphaToCoverageEnable.as_bool(),
+                        independent = g.blend.IndependentBlendEnable.as_bool(),
+                        targets = ?&g.targets.RTFormats[..n],
+                        blend = ?&g.blend.RenderTarget[..n.max(1)],
+                        sample_mask = g.sample_mask,
+                        "VIcky: pipeline state"
+                    );
+                }
+            }
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,

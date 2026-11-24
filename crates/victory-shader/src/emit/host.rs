@@ -291,6 +291,21 @@ impl Host {
     }
 
     /// A compute pipeline; user data is root parameter 0.
+    /// VIcky (local measurement): the driver's own shader cache off for this device (developer
+    /// mode), so pipeline times are first compiles. Whether it took.
+    pub fn shader_cache_off(&self) -> bool {
+        // SAFETY: a live device.
+        unsafe {
+            self.device.cast::<ID3D12Device9>().and_then(|d| {
+                d.ShaderCacheControl(
+                    D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED,
+                    D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE,
+                )
+            })
+        }
+        .is_ok()
+    }
+
     pub fn compute_pipeline(
         &self,
         cs: &HostShader,

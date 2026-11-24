@@ -201,7 +201,7 @@ impl RtvRecord {
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
         const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        self.host_desc(TEXTURE_2D, true)
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -210,30 +210,54 @@ impl RtvRecord {
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
         const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        self.host_desc(TEXTURE_2D, false)
     }
 
     /// The description words as a host type, the format as the host has it.
     /// Without one, a typeless host copy gets a 2D view (`dimension`) in
     /// the title's format, which the host needs spelled out.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
+    fn host_desc<T>(&self, dimension: u32, colour: bool) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
+        // VIcky: the host texture's own format, when it is typeless (a
+        // render target view of it must name a typed format).
+        let typeless_host = || {
+            let host = crate::resource::host_resource(self.resource)?;
+            // SAFETY: a live resource.
+            let format = unsafe { host.GetDesc() }.Format.0 as u32;
+            crate::resource::is_typeless(format).then_some(format)
+        };
         let mut words = if self.described != 0 {
             self.desc
         } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
+            let format = match crate::resource::view_format(self.resource) {
+                Some(format) => format,
+                None if colour => typeless_host()?,
+                None => return None,
+            };
+            [format, dimension, 0, 0, 0, 0]
         };
         // Render target and depth views: a packed 16-bit target may be
         // R8G8B8A8_UNORM on this GPU (`resource::target_format`).
         words[0] = crate::resource::target_format(words[0]);
+        // VIcky: a colour view that names no format or a typeless one, of a
+        // typeless texture, takes the family's first concrete format (as
+        // shader views do since the port of VIctory #876). D3D12 refuses a
+        // typeless render target view, and the draws' writes to it are lost.
+        if colour {
+            let base = if words[0] == 0 { typeless_host() } else { Some(words[0]) };
+            if let Some(base) = base.filter(|&f| crate::resource::is_typeless(f)) {
+                words[0] = crate::resource::first_concrete(base);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        typeless = base,
+                        typed = words[0],
+                        "VIcky: a render target view of a typeless texture takes a typed format"
+                    );
+                });
+            }
+        }
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }

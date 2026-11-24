@@ -121,7 +121,20 @@ impl HostHeap {
         // A view heap ends with its guard slot, after the dynamic ones (see
         // [`HostHeap::guard_slot`]).
         let guard = u32::from(!sampler);
-        let (heap, count) = match make(count + extra + guard) {
+        // VIcky (diagnostics): `VICTORY_VIEW_HEAP_CAP=1000000` caps the view heap as NVIDIA
+        // does, on a GPU that takes the whole heap (an A/B of the cap on the same GPU).
+        let forced_cap = (!sampler)
+            .then(|| std::env::var("VICTORY_VIEW_HEAP_CAP").ok()?.parse::<u32>().ok())
+            .flatten()
+            .filter(|&cap| count + extra + guard > cap);
+        let made = match forced_cap {
+            Some(cap) => {
+                tracing::warn!(cap, "VIcky: view heap cap forced");
+                Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG))
+            }
+            None => make(count + extra + guard),
+        };
+        let (heap, count) = match made {
             Ok(heap) => (heap, count),
             Err(e) if !sampler && count + extra + guard > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
@@ -1264,6 +1277,26 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VIcky probe (run with `--ignored --nocapture`): the shader-visible view heap sizes
+    /// this GPU accepts, around the title's 1,245,184 slots.
+    #[test]
+    #[ignore]
+    fn probe_view_heap_sizes() {
+        let Some(host) = host() else { return };
+        for n in [1_000_000u32, 1_048_576, 1_100_000, 1_245_184, 1_245_185, 1_250_000, 1_261_569, 1_310_720, 1_507_329, 2_000_000] {
+            // SAFETY: plain heap creation.
+            let r: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: n,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+            };
+            eprintln!("view heap {n:>9}: {}", if r.is_ok() { "accepted".to_string() } else { format!("refused {:#x}", r.err().unwrap().code().0) });
+        }
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

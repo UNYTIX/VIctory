@@ -114,6 +114,23 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                // VIcky (local): `VICTORY_DUMP_SHADERS=<folder>` keeps the containers
+                // of translated shaders too (only those listed in
+                // `VICTORY_DUMP_SHADERS_ONLY=<hash>,<hash>` when it is set), for
+                // `victory shader-info --disasm` (title data: never commit it)
+                if done.is_ok()
+                    && let Some(dir) = std::env::var_os("VICTORY_DUMP_SHADERS")
+                {
+                    let hash = self.hash.to_string();
+                    let wanted = std::env::var("VICTORY_DUMP_SHADERS_ONLY")
+                        .map_or(true, |only| only.split(',').any(|h| h.trim() == hash));
+                    if wanted {
+                        let path =
+                            std::path::Path::new(&dir).join(format!("{}-{}.bin", self.stage, hash));
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(path, &self.container[..]);
+                    }
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,

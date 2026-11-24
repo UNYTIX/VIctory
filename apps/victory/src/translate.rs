@@ -326,6 +326,16 @@ fn translate(
     checks: &mut Checks,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
+    // Local measurement for XCL issue #1269: `VICTORY_TIME_CS=<file of record names>` times only
+    // those compute programs (run with `--pipelines --jobs 1`).
+    let timing = time_cs_names();
+    let label = source.label();
+    let record = label.split_once(' ').map_or("", |(_, name)| name).to_string();
+    if let Some(names) = timing
+        && !names.contains(&record)
+    {
+        return;
+    }
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
@@ -346,6 +356,11 @@ fn translate(
     };
     for p in programs {
         t.programs += 1;
+        if timing.is_some() && p.stage != HwStage::Cs {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let native_insts = p.code.len() / 4;
         match ir::build_with(&p.patched_code(), p.wave64, p.vgprs, p.spills_root_args()) {
             Ok(mut program) => {
                 victory_shader::sgpr_spill::forward(&mut program);
@@ -409,6 +424,26 @@ fn translate(
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit(&container, &p, &program, &s, &i, &r, checks.target) {
+                        Ok(shader) if timing.is_some() => {
+                            let emit_ms = started.elapsed().as_secs_f64() * 1000.0;
+                            let (pso_ms, result) = match &checks.host {
+                                Some((h, _)) => {
+                                    static ONCE: std::sync::Once = std::sync::Once::new();
+                                    ONCE.call_once(|| {
+                                        eprintln!("time: driver shader cache off: {}", h.shader_cache_off());
+                                    });
+                                    let at = std::time::Instant::now();
+                                    let made = h.compute_pipeline(&shader);
+                                    let ms = at.elapsed().as_secs_f64() * 1000.0;
+                                    (ms, made.map_or_else(|e| format!("refused: {e}"), |_| "ok".into()))
+                                }
+                                None => (0.0, "no host (--pipelines)".into()),
+                            };
+                            println!(
+                                "TIME	{record}	{native_insts}	{emit_ms:.1}	{}	{pso_ms:.0}	{result}",
+                                shader.dxil.len()
+                            );
+                        }
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -430,6 +465,18 @@ fn translate(
             }
         }
     }
+}
+
+/// `VICTORY_TIME_CS`: the record names to time, one per line.
+fn time_cs_names() -> Option<&'static HashSet<String>> {
+    static NAMES: std::sync::OnceLock<Option<HashSet<String>>> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            let file = std::env::var("VICTORY_TIME_CS").ok()?;
+            let text = std::fs::read_to_string(file).ok()?;
+            Some(text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+        })
+        .as_ref()
 }
 
 /// Validates an emitted shader if asked to.

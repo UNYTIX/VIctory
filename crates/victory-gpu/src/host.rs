@@ -184,6 +184,14 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some((adapter, name)) = std::env::var("VICTORY_ADAPTER")
+            .ok()
+            .and_then(|want| named_adapter(&want))
+        {
+            // VIcky: `VICTORY_ADAPTER=<part of its name>` runs on that GPU
+            // (for example `radeon`, an integrated GPU with 64-lane waves).
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!(adapter = %name, "host device on the chosen adapter");
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -242,6 +250,27 @@ fn create() -> windows::core::Result<Host> {
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
+/// VIcky: the first hardware adapter whose name holds `want` (ignoring case).
+fn named_adapter(want: &str) -> Option<(IDXGIAdapter1, String)> {
+    let want = want.to_lowercase();
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut i = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            let Ok(d) = adapter.GetDesc1() else { continue };
+            let n = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+            let name = String::from_utf16_lossy(&d.Description[..n]);
+            if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && name.to_lowercase().contains(&want) {
+                return Some((adapter, name));
+            }
+        }
+        tracing::warn!(want, "VICTORY_ADAPTER: no such adapter; using the default one");
+        None
+    }
+}
+
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     // SAFETY: plain DXGI adapter queries.
     unsafe {
@@ -898,6 +927,18 @@ impl Host {
             } else {
                 victory_shader::emit::Target::ANY
             };
+            // VIcky (diagnostics): `VICTORY_HOST_LANES_MAX=32` translates as for a host
+            // without 64-lane waves on one that has them (an A/B of the wave64 emulation on
+            // the same GPU and driver).
+            let mut target = target;
+            if let Some(max) = std::env::var("VICTORY_HOST_LANES_MAX")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                target.lanes_max = target.lanes_max.min(max);
+                target.lanes_min = target.lanes_min.min(target.lanes_max);
+                tracing::info!(max, "VIcky: host wave sizes clamped");
+            }
             tracing::info!(
                 lanes_min = target.lanes_min,
                 lanes_max = target.lanes_max,
