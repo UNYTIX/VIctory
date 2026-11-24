@@ -639,6 +639,11 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // combo: the dispatches of a listed frame, in order, with their programs
+        #[cfg(feature = "diagnostics")]
+        if tracing::enabled!(tracing::Level::DEBUG) && crate::capture::listed(crate::queue::presented() + 1) {
+            tracing::debug!("dispatch {x}x{y}x{z} {}", crate::pipeline::trace_name(self.pipeline as This));
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -944,9 +949,10 @@ impl State {
             .collect();
         let v = self.vertex[0];
         let line = format!(
-            "{kind} {count} from {first} topology {} pipeline {:#x} targets {targets:?} vb {:#x}+{} stride {} reads {:?}",
+            "{kind} {count} from {first} topology {} pipeline {:#x} [{}] targets {targets:?} vb {:#x}+{} stride {} reads {:?}",
             self.topology,
             self.pipeline,
+            crate::pipeline::trace_name(self.pipeline as This),
             v.address,
             v.size,
             v.stride,

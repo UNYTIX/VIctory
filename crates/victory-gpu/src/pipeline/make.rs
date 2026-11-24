@@ -83,6 +83,12 @@ impl Pending {
     }
 }
 
+/// combo: the pipeline's shaders, "<stage> <hash>" each (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn names(p: &Pending) -> String {
+    p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect::<Vec<_>>().join(" + ")
+}
+
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]

@@ -325,6 +325,21 @@ pub(crate) fn note_drop(this: This) {
     }
 }
 
+/// combo: a pipeline for traces: its shaders, and why it has no host
+/// pipeline if it has none (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn trace_name(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline set".into();
+    }
+    let p = pipeline(this);
+    let why = skipped_shader(p)
+        .map(|h| format!(" SKIPPED {h}"))
+        .or_else(|| make::missing(&p.host).map(|w| format!(" MISSING {w}")))
+        .unwrap_or_default();
+    format!("{}{why}", make::names(&p.host))
+}
+
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
