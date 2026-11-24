@@ -254,9 +254,9 @@ pub(crate) fn save_read_back(
 /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
 /// (what each holds at the end of the frame; formats normalized to show
-/// structure: floats scaled by their 99.9th percentile, depth by its range
-/// without the outer 0.1% on each side; see [`Scale`]). Each is logged first
-/// as `target values`, with its true maximum and how much of it is non-zero.
+/// structure: see [`Scale`]). Each that is not 8-bit colour is logged first
+/// as `target values`, with its largest finite value and how many of its
+/// channel values are non-zero.
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
@@ -428,7 +428,15 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
     let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
-    let s = Scale::of(values.iter().flatten().copied(), grey);
+    // Channels the decoder fills; the rest of each [f32; 3] is padding.
+    let channels = if grey {
+        1
+    } else if matches!(format, 15..=16 | 33..=38 | 48..=52) {
+        2
+    } else {
+        3
+    };
+    let s = Scale::of(&values, channels, grey);
     tracing::info!(
         format,
         low = s.low,
@@ -439,9 +447,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         mean = s.mean,
         "target values"
     );
-    let (low, range) = (s.low, (s.high - s.low).max(1e-20));
     for v in values {
-        let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
+        let c = v.map(|c| s.byte(c));
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
@@ -449,22 +456,24 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
 
 /// How a float target's values map to 0..255 in its dump. Scaling by the
 /// largest value let one hot pixel (a light source at thousands) turn a lit
-/// HDR target black, so the 99.9th percentile is white and the brightest
-/// 0.1% saturate. If that percentile is 0 while some values are not, the
-/// maximum is used, so a target with only a few lit pixels still shows them.
-/// Single channels (`grey`, depth among them) map the 0.1st to the 99.9th
-/// percentile; colour starts at 0. Percentiles come from at most [`SAMPLES`]
-/// evenly spaced values.
+/// HDR target black, so colour runs from 0 to about the 99.9th percentile of
+/// the channel values, and single channels (`grey`, depth among them) from
+/// about the 0.1st to the 99.9th; values outside saturate. Where that range is
+/// empty (most of the target 0, or all of it negative), the minimum to the
+/// maximum is used instead. Percentiles come from whole pixels at an even
+/// stride, at most [`SAMPLES`] values; counts, maximum and mean cover every
+/// pixel's real channels (not a decoder's padding). Non-finite values are
+/// left out of all of it and dumped black.
 #[derive(Debug, PartialEq)]
 struct Scale {
     low: f32,
     high: f32,
     /// The largest finite value.
     max: f32,
-    /// Finite values that are not 0, and all finite values.
+    /// Finite channel values that are not 0, and all finite channel values.
     nonzero: usize,
     finite: usize,
-    /// Over the finite values.
+    /// Over the finite channel values (approximate where they cancel).
     mean: f64,
 }
 
@@ -472,19 +481,30 @@ struct Scale {
 const SAMPLES: usize = 1 << 20;
 
 impl Scale {
-    fn of(values: impl Iterator<Item = f32>, grey: bool) -> Scale {
-        let finite: Vec<f32> = values.filter(|v| v.is_finite()).collect();
-        let (mut min, mut max, mut sum, mut nonzero) = (f32::MAX, f32::MIN, 0f64, 0);
-        for &v in &finite {
-            (min, max) = (min.min(v), max.max(v));
-            sum += f64::from(v);
-            nonzero += usize::from(v != 0.0);
+    /// The scale of `pixels`, whose first `channels` entries are real.
+    fn of(pixels: &[[f32; 3]], channels: usize, grey: bool) -> Scale {
+        let channels = channels.clamp(1, 3);
+        let (mut min, mut max, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0f64);
+        let (mut nonzero, mut finite) = (0, 0);
+        for &v in pixels.iter().flat_map(|p| &p[..channels]) {
+            if v.is_finite() {
+                (min, max) = (min.min(v), max.max(v));
+                sum += f64::from(v);
+                finite += 1;
+                nonzero += usize::from(v != 0.0);
+            }
         }
-        if finite.is_empty() {
+        if finite == 0 {
             (min, max) = (0.0, 0.0);
         }
-        let step = finite.len().div_ceil(SAMPLES).max(1);
-        let mut sample: Vec<f32> = finite.iter().step_by(step).copied().collect();
+        // Whole pixels, so a stride never lands on one channel only.
+        let step = (pixels.len() * channels).div_ceil(SAMPLES).max(1);
+        let mut sample: Vec<f32> = pixels
+            .iter()
+            .step_by(step)
+            .flat_map(|p| p[..channels].iter().copied())
+            .filter(|v| v.is_finite())
+            .collect();
         let mut at = |q: f64| {
             if sample.is_empty() {
                 return 0.0;
@@ -494,20 +514,36 @@ impl Scale {
         };
         let (mut low, mut high) = (if grey { at(0.001) } else { 0.0 }, at(0.999));
         if high <= low {
-            (low, high) = (if grey { min } else { 0.0 }, max);
+            (low, high) = (min, max);
+            if !grey && min >= 0.0 {
+                low = 0.0;
+            }
         }
         Scale {
             low,
             high,
             max,
             nonzero,
-            finite: finite.len(),
-            mean: if finite.is_empty() {
+            finite,
+            mean: if finite == 0 {
                 0.0
             } else {
-                sum / finite.len() as f64
+                sum / finite as f64
             },
         }
+    }
+
+    /// A channel value as 0..255 (computed in f64, so even the widest
+    /// finite range keeps its ends apart; non-finite is 0).
+    fn byte(&self, v: f32) -> u8 {
+        if !v.is_finite() {
+            return 0;
+        }
+        let range = f64::from(self.high) - f64::from(self.low);
+        if range <= 0.0 {
+            return if v >= self.high { 255 } else { 0 };
+        }
+        ((f64::from(v) - f64::from(self.low)) / range * 255.0).clamp(0.0, 255.0) as u8
     }
 }
 
@@ -641,40 +677,85 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 mod scale_tests {
     use super::Scale;
 
+    fn colour(values: impl Iterator<Item = f32>) -> Vec<[f32; 3]> {
+        values.map(|v| [v, v, v]).collect()
+    }
+
     #[test]
     fn one_hot_pixel_does_not_set_the_scale() {
-        // A lit target: 10,000 values around 1.0 and one light at 11,088.
-        let values = (0..10_000).map(|i| 0.5 + (i % 100) as f32 / 100.0).chain([11_088.0]);
-        let s = Scale::of(values, false);
+        // A lit target: 10,000 pixels around 1.0 and one light at 11,088.
+        let values = (0..10_000).map(|i| 0.5 + (i % 100) as f32 / 100.0);
+        let pixels = colour(values.chain([11_088.0]));
+        let s = Scale::of(&pixels, 3, false);
         assert_eq!((s.low, s.max), (0.0, 11_088.0));
-        assert!(s.high < 1.5, "high {} follows the bulk, not the light", s.high);
-        assert_eq!((s.nonzero, s.finite), (10_001, 10_001));
+        assert!(
+            s.high < 1.5,
+            "high {} follows the bulk, not the light",
+            s.high
+        );
+        assert_eq!((s.nonzero, s.finite), (30_003, 30_003));
+        assert_eq!(s.byte(11_088.0), 255);
+        assert!(s.byte(1.0) > 150);
+    }
+
+    #[test]
+    fn a_strided_sample_keeps_every_channel() {
+        // More values than SAMPLES, so the sample strides: a uniform
+        // (1, 10, 100) must still scale to its blue channel.
+        let pixels = vec![[1.0, 10.0, 100.0]; super::SAMPLES];
+        let s = Scale::of(&pixels, 3, false);
+        assert_eq!((s.low, s.high), (0.0, 100.0));
+        assert_eq!([1.0, 10.0, 100.0].map(|c| s.byte(c)), [2, 25, 255]);
+    }
+
+    #[test]
+    fn padding_channels_are_not_counted() {
+        // RG: the decoder fills blue with 0.
+        let pixels = vec![[2.0, 4.0, 0.0]; 1000];
+        let s = Scale::of(&pixels, 2, false);
+        assert_eq!((s.finite, s.nonzero, s.mean), (2000, 2000, 3.0));
+        // Grey: one value, repeated in all three.
+        let s = Scale::of(&[[5.0; 3]; 10], 1, true);
+        assert_eq!((s.finite, s.mean), (10, 5.0));
     }
 
     #[test]
     fn a_few_lit_pixels_on_black_still_show() {
         // 99.95% zero: the 99.9th percentile is 0, so the maximum is used.
         let values = std::iter::repeat_n(0.0, 19_990).chain(std::iter::repeat_n(7.0, 10));
-        let s = Scale::of(values, false);
-        assert_eq!((s.low, s.high, s.nonzero), (0.0, 7.0, 10));
+        let s = Scale::of(&colour(values), 3, false);
+        assert_eq!((s.low, s.high, s.nonzero), (0.0, 7.0, 30));
+        assert_eq!((s.byte(0.0), s.byte(7.0)), (0, 255));
     }
 
     #[test]
     fn single_channels_drop_the_outer_tenth_of_a_percent() {
-        // Depth-like: most at 0.4-0.6, a few far values at both ends.
         let values = (0..10_000)
             .map(|i| 0.4 + (i % 1000) as f32 / 5000.0)
             .chain([-1e30, 1e30, f32::NAN, f32::INFINITY]);
-        let s = Scale::of(values, true);
+        let s = Scale::of(&colour(values), 1, true);
         assert!(s.low >= 0.4 && s.high <= 0.6, "{} .. {}", s.low, s.high);
         assert_eq!((s.max, s.finite), (1e30, 10_002));
+        assert_eq!((s.byte(f32::NAN), s.byte(f32::INFINITY)), (0, 0));
+    }
+
+    #[test]
+    fn negative_and_extreme_ranges_still_map() {
+        // All-negative colour: min..max, not 0..(a negative high).
+        let s = Scale::of(&colour([-4.0, -2.0].into_iter()), 3, false);
+        assert_eq!((s.low, s.high), (-4.0, -2.0));
+        assert_eq!((s.byte(-4.0), s.byte(-2.0)), (0, 255));
+        // The widest finite range keeps its ends apart (f32 would overflow).
+        let s = Scale::of(&colour([-f32::MAX, f32::MAX].into_iter()), 1, true);
+        assert_eq!((s.byte(-f32::MAX), s.byte(f32::MAX)), (0, 255));
     }
 
     #[test]
     fn an_empty_or_flat_target_has_a_range() {
-        let s = Scale::of(std::iter::empty(), false);
+        let s = Scale::of(&[], 3, false);
         assert_eq!((s.low, s.high, s.max, s.finite), (0.0, 0.0, 0.0, 0));
-        let s = Scale::of(std::iter::repeat_n(3.0, 100), true);
+        assert_eq!(s.byte(0.0), 255);
+        let s = Scale::of(&[[3.0; 3]; 100], 1, true);
         assert_eq!((s.low, s.high, s.mean), (3.0, 3.0, 3.0));
     }
 }
