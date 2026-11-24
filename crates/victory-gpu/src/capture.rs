@@ -27,6 +27,36 @@ pub(crate) fn listed(n: u64) -> bool {
             .collect()
     })
     .contains(&n)
+        || timed(n)
+}
+
+/// combo (local): `VICTORY_CAPTURE_AT_SECS=150,200`: the first frame built after each of
+/// those seconds of the run is listed too (menus take a different number of frames each run).
+fn timed(n: u64) -> bool {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LEFT: std::sync::Mutex<Option<Vec<f64>>> = std::sync::Mutex::new(None);
+    static CHOSEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+    let start = *START.get_or_init(std::time::Instant::now);
+    let mut chosen = CHOSEN.lock().unwrap_or_else(|e| e.into_inner());
+    if chosen.contains(&n) {
+        return true;
+    }
+    let mut left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+    let left = left.get_or_insert_with(|| {
+        std::env::var("VICTORY_CAPTURE_AT_SECS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|t| t.trim().parse().ok())
+            .collect()
+    });
+    let now = start.elapsed().as_secs_f64();
+    if let Some(i) = left.iter().position(|&t| now >= t) {
+        left.remove(i);
+        chosen.push(n);
+        tracing::info!(frame = n, secs = now, "combo: frame listed for capture");
+        return true;
+    }
+    false
 }
 
 /// A plane selected for this frame, with the same resource ID as its target dump.
