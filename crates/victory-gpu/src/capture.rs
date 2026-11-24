@@ -467,9 +467,10 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
 /// maximum is used instead; a flat target is black at 0 or below and white
 /// above. Percentiles come from whole pixels, one per stride at a jittered
 /// place in it (so a stride cannot follow a column pattern), at most
-/// [`SAMPLES`] values. Counts, maximum and mean cover every pixel's decoded
-/// channels (not a decoder's padding; alpha is not decoded). Non-finite
-/// values are left out of all of it and dumped black.
+/// [`SAMPLES`] values (see [`sample_positions`]). Counts, maximum and mean
+/// cover every pixel's decoded channels: not a decoder's padding, nor the
+/// alpha of multichannel colour formats (an alpha-only format is decoded as
+/// grey). Non-finite values are left out of all of it and dumped black.
 #[derive(Debug, PartialEq)]
 struct Scale {
     low: f32,
@@ -485,6 +486,24 @@ struct Scale {
 
 /// Values the percentiles of a [`Scale`] are taken from at most.
 const SAMPLES: usize = 1 << 20;
+
+/// The pixels (of `len`, with `channels` values each) a [`Scale`] samples:
+/// at most `SAMPLES / channels` whole pixels, one per stride at a hashed
+/// place in it, so no stride lines up with a row's column pattern; the last
+/// stride may be partial and is sampled too.
+fn sample_positions(len: usize, channels: usize) -> impl Iterator<Item = usize> {
+    let pixels = (SAMPLES / channels.max(1)).max(1);
+    let step = len.div_ceil(pixels).max(1);
+    (0..len.div_ceil(step)).map(move |i| {
+        // splitmix64: no short period, unlike a multiplicative step.
+        let mut z = (i as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let start = i * step;
+        start + (z % (len - start).min(step) as u64) as usize
+    })
+}
 
 impl Scale {
     /// The scale of `pixels`, whose first `channels` entries are decoded.
@@ -503,16 +522,9 @@ impl Scale {
         if finite == 0 {
             (min, max) = (0.0, 0.0);
         }
-        // Whole pixels, so a stride never lands on one channel only, each at
-        // a jittered place in its stride, so a stride that divides a row
-        // cannot sample one column pattern only.
-        let step = (pixels.len() * channels).div_ceil(SAMPLES).max(1);
-        let jitter = |i: usize| (i.wrapping_mul(2_654_435_761) >> 7) % step;
-        let mut sample: Vec<f32> = (0..pixels.len().div_ceil(step))
-            .filter_map(|i| pixels.get(i * step + jitter(i)))
-            .flat_map(|p| p[..channels].iter().copied())
+        let mut sample: Vec<f32> = sample_positions(pixels.len(), channels)
+            .flat_map(|i| pixels[i][..channels].iter().copied())
             .filter(|v| v.is_finite())
-            .take(SAMPLES)
             .collect();
         let mut at = |q: f64| {
             if sample.is_empty() {
@@ -731,13 +743,35 @@ mod scale_tests {
     }
 
     #[test]
-    fn the_sample_stays_within_its_cap() {
-        // 1024 x 1024 with three channels: a stride of 3 pixels.
-        let pixels = vec![[1.0f32; 3]; 1 << 20];
-        let step = (pixels.len() * 3).div_ceil(super::SAMPLES);
-        assert_eq!(step, 3);
-        let s = Scale::of(&pixels, 3, false);
-        assert_eq!((s.finite, s.high), (3 << 20, 1.0));
+    fn sample_positions_stay_in_range_and_within_the_cap() {
+        use super::{SAMPLES, sample_positions};
+        for (len, channels) in [(0, 3), (1, 3), (1 << 20, 3), (2048 * 2560, 3), (12_345, 1)] {
+            let at: Vec<usize> = sample_positions(len, channels).collect();
+            assert!(at.iter().all(|&i| i < len), "{len}");
+            assert!(at.len() * channels <= SAMPLES, "{len}: {}", at.len());
+            assert!(
+                at.windows(2).all(|w| w[0] < w[1]),
+                "{len}: in order, once each"
+            );
+            if len > 0 {
+                assert!(!at.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn the_jitter_does_not_repeat_along_a_row() {
+        // 512 x 1024 RGB: a stride of 2 pixels, a row every 256 strides. A
+        // jitter that repeats each row samples the same 256 columns only.
+        let (w, h) = (512, 1024);
+        let mut columns: Vec<usize> = super::sample_positions(w * h, 3).map(|i| i % w).collect();
+        columns.sort_unstable();
+        columns.dedup();
+        assert!(
+            columns.len() > 500,
+            "{} of {w} columns sampled",
+            columns.len()
+        );
     }
 
     #[test]
