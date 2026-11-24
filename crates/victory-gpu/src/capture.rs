@@ -298,6 +298,263 @@ pub(crate) fn dump_targets(frame: u64) {
     }
 }
 
+/// With `VICTORY_DUMP_TARGETS` set (and `VICTORY_CAPTURE`, as for targets),
+/// buffers too: the title memory ranges
+/// the listed frames bind for unordered access (a compute's output that
+/// later passes read), in first-binding order. Each is logged as
+/// `uav buffer <i>` when first bound: with the draw trace on, after the
+/// draw or dispatch that binds it. That is not always the writer: a draw
+/// can still be dropped after binding, later binders of the same range are
+/// not logged again, and a note can come without its trace line:
+/// `ExecuteIndirect` has none, and a command whose trace check and binding
+/// fall on either side of a present or of a listing by time can be noted
+/// for a listed frame its trace line did not go to. A range is one
+/// host copy, address and length: a buffer released and made again at the
+/// same address within the frame is noted twice. At the frame's present each range is summarized in the log
+/// (`uav buffer contents`); a range of at most [`RAW_MAX`] bytes is also
+/// saved whole as `frame-<n>-buf<i>-<address>-<len>.bin` (a larger one gets
+/// no file). At most [`NOTED_MAX`] ranges per frame are noted.
+///
+/// What is read is the range's host copy, the bytes the GPU side sees, at
+/// the present. Title memory can differ where the title's CPU wrote after
+/// the last copy-back, and work of the next frame that other threads
+/// already submit can change the copy while it is read.
+///
+/// shortcut: ranges are noted when commands are recorded, so a list
+/// recorded in another frame and submitted again in a listed one is not
+/// seen; and they are the ranges declared for copy-back
+/// (`Shadow::gpu_writes`), so a buffer a shader reaches only through the
+/// resource heap, and not through its tables, is not seen either. A frame
+/// listed by time is noted only from the moment it is listed; the frame
+/// after it is usually whole, but can miss ranges bound just before.
+static BUFFERS: std::sync::Mutex<Notes<NotedBuffer>> = std::sync::Mutex::new(Notes::new());
+
+/// A range a listed frame's shaders write: its host copy, address, length.
+type NotedBuffer = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+
+/// Ranges noted per frame at most (the world binds a few hundred).
+const NOTED_MAX: usize = 4096;
+/// Largest range saved as a file (the world also binds views of its whole
+/// heap, about 174 MB, which are only summarized).
+const RAW_MAX: u64 = 4 << 20;
+/// Bytes read at a time to summarize a range.
+const PIECE: usize = 1 << 20;
+
+/// Notes by frame. `newest` is the latest frame dumped and `taken` the
+/// frames dumped within [`STALE`] frames of it. A note for a dumped frame
+/// (its recorder read the frame number before that frame's present took the
+/// notes), or for a frame `STALE` or more frames older than `newest`, is
+/// refused rather than kept and never dumped. Presents may overlap, so each
+/// frame is taken on its own; when a frame is taken, notes `STALE` or more
+/// frames older than `newest` are dropped (a present that late finds none).
+/// Notes of a frame never presented as listed stay until a listed present
+/// at least `STALE` frames later.
+struct Notes<T> {
+    newest: u64,
+    taken: Vec<u64>,
+    notes: Vec<(u64, T)>,
+}
+
+/// The age, in frames, at which a note is too old to keep.
+const STALE: u64 = 64;
+
+impl<T> Notes<T> {
+    const fn new() -> Notes<T> {
+        Notes {
+            newest: 0,
+            taken: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// Whether `frame` is old enough, next to the newest frame dumped, for
+    /// its notes to go.
+    fn stale(&self, frame: u64) -> bool {
+        is_stale(frame, self.newest)
+    }
+
+    /// Adds `note` to `frame`'s notes; its index there, or `None` if the
+    /// frame was already taken or is stale, `same` finds an equal note of
+    /// that frame, or it has [`NOTED_MAX`] notes.
+    fn add(&mut self, frame: u64, note: T, same: impl Fn(&T) -> bool) -> Option<usize> {
+        if self.taken.contains(&frame) || self.stale(frame) {
+            return None;
+        }
+        let mut this_frame = self.notes.iter().filter(|n| n.0 == frame);
+        let i = this_frame.clone().count();
+        if i >= NOTED_MAX || this_frame.any(|n| same(&n.1)) {
+            return None;
+        }
+        self.notes.push((frame, note));
+        Some(i)
+    }
+
+    /// `frame`'s notes, in order; other frames' stay, unless stale.
+    fn take(&mut self, frame: u64) -> Vec<T> {
+        self.newest = self.newest.max(frame);
+        self.taken.push(frame);
+        let newest = self.newest;
+        let stale = |f: u64| is_stale(f, newest);
+        self.taken.retain(|&f| !stale(f));
+        let (now, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.notes)
+            .into_iter()
+            .partition(|n| n.0 == frame);
+        self.notes = rest.into_iter().filter(|n| !stale(n.0)).collect();
+        now.into_iter().map(|n| n.1).collect()
+    }
+}
+
+/// Whether `frame` is [`STALE`] or more frames older than `newest`.
+fn is_stale(frame: u64, newest: u64) -> bool {
+    frame < newest && newest - frame >= STALE
+}
+
+/// Notes a range of title memory the frame being built binds for unordered
+/// access.
+pub(crate) fn note_buffer(shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) {
+    let frame = crate::queue::presented() + 1;
+    if !dump_on() || !listed(frame) {
+        return;
+    }
+    let mut buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    let same =
+        |(s, a, l): &NotedBuffer| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (address, len);
+    if let Some(i) = buffers.add(frame, (shadow.clone(), address, len), same) {
+        tracing::info!(i, address = format_args!("{address:#x}"), len, "uav buffer");
+    }
+}
+
+/// At the present of frame `frame`: summarizes the ranges noted for it.
+/// Notes for the next frame, which other threads may already be recording,
+/// stay.
+pub(crate) fn dump_buffers(frame: u64) {
+    let this_frame = BUFFERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(frame);
+    for (i, (shadow, address, len)) in this_frame.into_iter().enumerate() {
+        let mut sum = Summing::new();
+        let mut raw = (len <= RAW_MAX).then(Vec::new);
+        let read = shadow.read_pieces(address, len, PIECE, |piece| {
+            sum.add(piece);
+            if let Some(raw) = &mut raw {
+                raw.extend_from_slice(piece);
+            }
+        });
+        if !read {
+            tracing::warn!(
+                frame,
+                i,
+                address = format_args!("{address:#x}"),
+                "uav buffer not read"
+            );
+            continue;
+        }
+        let s = sum.finish();
+        tracing::info!(
+            frame,
+            i,
+            address = format_args!("{address:#x}"),
+            len = s.bytes,
+            dwords = s.dwords,
+            zero = s.zero,
+            nonfinite = s.nonfinite,
+            min = s.min,
+            max = s.max,
+            mean = s.mean,
+            "uav buffer contents{}",
+            if s.all_zero { " (all zero)" } else { "" }
+        );
+        let (Some(raw), Some(folder)) = (raw, folder()) else {
+            continue;
+        };
+        let name = format!("frame-{frame}-buf{i:03}-{address:#x}-{}.bin", raw.len());
+        let path = folder.join(name);
+        if let Err(e) = std::fs::write(&path, &raw) {
+            tracing::warn!(error = %e, path = %path.display(), "buffer not saved");
+        }
+    }
+}
+
+/// A buffer's contents in a few numbers, its dwords read as `f32` (the
+/// usual element of the buffers lighting reads).
+#[derive(Debug, Default, PartialEq)]
+struct Stats {
+    bytes: usize,
+    /// Every byte is 0, a trailing partial dword included.
+    all_zero: bool,
+    dwords: usize,
+    /// Dwords that are 0.
+    zero: usize,
+    /// Dwords that are NaN or infinite as floats.
+    nonfinite: usize,
+    /// Over the finite floats (0 when there are none).
+    min: f32,
+    max: f32,
+    mean: f64,
+}
+
+/// [`Stats`] built from pieces of a range, read in order; every piece but
+/// the last must be a whole number of dwords.
+struct Summing {
+    s: Stats,
+    finite: usize,
+    sum: f64,
+    min: f32,
+    max: f32,
+    nonzero: bool,
+}
+
+impl Summing {
+    fn new() -> Summing {
+        Summing {
+            s: Stats::default(),
+            finite: 0,
+            sum: 0.0,
+            min: f32::INFINITY,
+            max: f32::NEG_INFINITY,
+            nonzero: false,
+        }
+    }
+
+    fn add(&mut self, bytes: &[u8]) {
+        self.s.bytes += bytes.len();
+        self.nonzero |= bytes.iter().any(|&b| b != 0);
+        for d in bytes.as_chunks::<4>().0 {
+            let bits = u32::from_le_bytes(*d);
+            let v = f32::from_bits(bits);
+            self.s.dwords += 1;
+            self.s.zero += usize::from(bits == 0);
+            if v.is_finite() {
+                self.finite += 1;
+                self.sum += f64::from(v);
+                self.min = self.min.min(v);
+                self.max = self.max.max(v);
+            } else {
+                self.s.nonfinite += 1;
+            }
+        }
+    }
+
+    fn finish(self) -> Stats {
+        let mut s = self.s;
+        s.all_zero = !self.nonzero;
+        if self.finite > 0 {
+            (s.min, s.max, s.mean) = (self.min, self.max, self.sum / self.finite as f64);
+        }
+        s
+    }
+}
+
+impl Stats {
+    #[cfg(test)]
+    fn of(bytes: &[u8]) -> Stats {
+        let mut sum = Summing::new();
+        sum.add(bytes);
+        sum.finish()
+    }
+}
+
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
@@ -835,8 +1092,182 @@ mod scale_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::Stats;
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    fn bytes(dwords: &[u32]) -> Vec<u8> {
+        dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn an_empty_buffer_reads_as_all_zero() {
+        let s = Stats::of(&[0; 64]);
+        assert!(s.all_zero);
+        assert_eq!((s.bytes, s.dwords, s.zero, s.nonfinite), (64, 16, 16, 0));
+        assert_eq!((s.min, s.max, s.mean), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn floats_are_summarized_and_nonfinite_ones_counted_apart() {
+        let s = Stats::of(&bytes(&[
+            1.5f32.to_bits(),
+            (-2.0f32).to_bits(),
+            0,
+            f32::NAN.to_bits(),
+            f32::INFINITY.to_bits(),
+            4.5f32.to_bits(),
+        ]));
+        let expected = Stats {
+            bytes: 24,
+            all_zero: false,
+            dwords: 6,
+            zero: 1,
+            nonfinite: 2,
+            min: -2.0,
+            max: 4.5,
+            mean: 1.0,
+        };
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn trailing_bytes_short_of_a_dword_are_left_out() {
+        let mut b = bytes(&[0x3f80_0000]); // 1.0
+        b.extend([0xff, 0xff]);
+        let s = Stats::of(&b);
+        assert_eq!((s.bytes, s.dwords, s.zero, s.max), (6, 1, 0, 1.0));
+    }
+
+    #[test]
+    fn a_nonzero_byte_past_the_last_dword_is_not_all_zero() {
+        // An 8-bit buffer of one byte, 0xff: no whole dword, but not empty.
+        let s = Stats::of(&[0xff]);
+        assert_eq!((s.bytes, s.dwords, s.zero), (1, 0, 0));
+        assert!(!s.all_zero);
+        let s = Stats::of(&[0, 0, 0, 0, 0, 0x01]);
+        assert_eq!((s.dwords, s.zero), (1, 1));
+        assert!(!s.all_zero);
+    }
+
+    #[test]
+    fn notes_stay_with_their_frame() {
+        let mut n = super::Notes::new();
+        let never = |_: &u32| false;
+        assert_eq!(n.add(10, 1, never), Some(0));
+        assert_eq!(n.add(10, 2, never), Some(1));
+        // The next frame's recorders may already note while 10 is dumped.
+        assert_eq!(n.add(11, 3, never), Some(0));
+        assert_eq!(n.take(10), [1, 2]);
+        assert_eq!(n.take(11), [3]);
+    }
+
+    #[test]
+    fn a_note_for_a_frame_already_taken_is_refused() {
+        let mut n = super::Notes::new();
+        let never = |_: &u32| false;
+        n.add(10, 1, never);
+        assert_eq!(n.take(10), [1]);
+        // Its recorder read frame 10 before the present took the notes.
+        assert_eq!(n.add(10, 2, never), None);
+        assert!(n.take(11).is_empty());
+        assert!(n.notes.is_empty());
+    }
+
+    #[test]
+    fn a_range_is_noted_once_per_frame_and_again_in_the_next() {
+        let mut n = super::Notes::new();
+        assert_eq!(n.add(5, 7, |&x| x == 7), Some(0));
+        assert_eq!(n.add(5, 7, |&x| x == 7), None);
+        // The same range bound again in the next frame is that frame's.
+        assert_eq!(n.add(6, 7, |&x| x == 7), Some(0));
+        assert_eq!(n.take(5), [7]);
+        assert_eq!(n.take(6), [7]);
+    }
+
+    #[test]
+    fn overlapping_presents_keep_each_frames_notes() {
+        let mut n = super::Notes::new();
+        let never = |_: &u32| false;
+        n.add(10, 1, never);
+        n.add(11, 2, never);
+        // Present 11 dumps before present 10 does.
+        assert_eq!(n.take(11), [2]);
+        // Frame 10's recorders may still note, and its present finds all.
+        assert_eq!(n.add(10, 3, never), Some(1));
+        assert_eq!(n.take(10), [1, 3]);
+    }
+
+    #[test]
+    fn a_frame_takes_at_most_noted_max_ranges() {
+        let mut n = super::Notes::new();
+        let never = |_: &usize| false;
+        for i in 0..super::NOTED_MAX {
+            assert_eq!(n.add(1, i, never), Some(i));
+        }
+        assert_eq!(n.add(1, super::NOTED_MAX, never), None);
+        assert_eq!(n.add(2, 0, never), Some(0));
+        assert_eq!(n.take(1).len(), super::NOTED_MAX);
+    }
+
+    #[test]
+    fn untaken_notes_go_once_stale() {
+        let mut n = super::Notes::new();
+        let never = |_: &u32| false;
+        n.add(36, 1, never);
+        n.add(37, 2, never);
+        n.add(100, 3, never);
+        assert_eq!(n.take(100), [3]);
+        // 64 frames older than the newest dumped: gone; 63: kept.
+        assert_eq!(n.take(36), [] as [u32; 0]);
+        assert_eq!(n.take(37), [2]);
+    }
+
+    #[test]
+    fn a_late_note_is_refused_once_its_frame_is_stale() {
+        let mut n = super::Notes::new();
+        let never = |_: &u32| false;
+        n.add(10, 1, never);
+        assert_eq!(n.take(10), [1]);
+        // More dumps than any fixed list would hold, all within the window.
+        for f in 11..=73 {
+            n.take(f);
+        }
+        assert_eq!(n.add(10, 2, never), None);
+        n.take(74);
+        // Frame 10 is out of `taken` now, but stale: still refused.
+        assert_eq!(n.add(10, 3, never), None);
+        assert!(n.notes.is_empty());
+    }
+
+    #[test]
+    fn frame_numbers_near_the_top_do_not_overflow() {
+        let mut n = super::Notes::new();
+        let never = |_: &u32| false;
+        n.add(u64::MAX, 1, never);
+        assert!(n.take(u64::MAX - 1).is_empty());
+        assert_eq!(n.take(u64::MAX), [1]);
+        // The other order: a note one frame older than the newest dumped.
+        let mut n = super::Notes::new();
+        n.add(u64::MAX - 1, 2, never);
+        assert!(n.take(u64::MAX).is_empty());
+        assert_eq!(n.take(u64::MAX - 1), [2]);
+    }
+
+    #[test]
+    fn pieces_sum_up_to_the_whole() {
+        let words: Vec<u32> = (0..1000u32)
+            .map(|i| (i as f32 * 0.5 - 100.0).to_bits())
+            .collect();
+        let mut all = bytes(&words);
+        all.push(7);
+        let mut sum = super::Summing::new();
+        for piece in all.chunks(64) {
+            sum.add(piece);
+        }
+        assert_eq!(sum.finish(), Stats::of(&all));
     }
 }
