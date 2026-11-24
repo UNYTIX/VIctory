@@ -254,7 +254,9 @@ pub(crate) fn save_read_back(
 /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
 /// (what each holds at the end of the frame; formats normalized to show
-/// structure: floats scaled by their largest value, depth by its range).
+/// structure: see [`Scale`]). Each that is not 8-bit colour is logged first
+/// as `target values`, with its largest finite value and how many of its
+/// channel values are non-zero.
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
@@ -368,9 +370,8 @@ fn small_float(bits: u32, man: u32) -> f32 {
 }
 
 /// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
-/// as channel values scaled so the largest finite one is white (single
-/// channels: lowest black, highest white, as grey). `None` for formats not
-/// handled.
+/// as channel values scaled by [`Scale`] (single channels as grey). `None`
+/// for formats not handled.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
@@ -427,19 +428,145 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
     let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
-    let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
-    let (low, high) = if grey {
-        finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
+    // Channels the decoder fills; the rest of each [f32; 3] is padding.
+    let channels = if grey {
+        1
+    } else if matches!(format, 15..=16 | 33..=38 | 48..=52) {
+        2
     } else {
-        (0.0, finite.fold(0.0f32, f32::max))
+        3
     };
-    let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high, "target values");
+    let s = Scale::of(&values, channels, grey);
+    tracing::info!(
+        format,
+        low = s.low,
+        high = s.high,
+        max = s.max,
+        nonzero = s.nonzero,
+        finite = s.finite,
+        mean = s.mean,
+        "target values"
+    );
     for v in values {
-        let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
+        let c = if grey {
+            [s.byte(v[0]); 3]
+        } else {
+            [0, 1, 2].map(|k| if k < channels { s.byte(v[k]) } else { 0 })
+        };
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
+}
+
+/// How a float target's values map to 0..255 in its dump. Scaling by the
+/// largest value let one hot pixel (a light source at thousands) turn a lit
+/// HDR target black, so colour runs from 0 to about the 99.9th percentile of
+/// the channel values, and single channels (`grey`, depth among them) from
+/// about the 0.1st to the 99.9th; values outside saturate. Where that range is
+/// empty (most of the target 0, or all of it negative), the minimum to the
+/// maximum is used instead; a flat target is black at 0 or below and white
+/// above. Percentiles come from whole pixels, one per stride at a hashed
+/// place in it (which makes following a column pattern unlikely), at most
+/// [`SAMPLES`] values (see [`sample_positions`]). Counts, maximum and mean
+/// cover every pixel's decoded channels: not a decoder's padding, nor the
+/// alpha of multichannel colour formats (an alpha-only format is decoded as
+/// grey). Non-finite values are left out of all of it and dumped black.
+#[derive(Debug, PartialEq)]
+struct Scale {
+    low: f32,
+    high: f32,
+    /// The largest finite value.
+    max: f32,
+    /// Finite decoded values that are not 0, and all finite decoded values.
+    nonzero: usize,
+    finite: usize,
+    /// Over the finite decoded values (approximate where they cancel).
+    mean: f64,
+}
+
+/// Values the percentiles of a [`Scale`] are taken from at most.
+const SAMPLES: usize = 1 << 20;
+
+/// The pixels (of `len`, with `channels` values each) a [`Scale`] samples:
+/// at most `SAMPLES / channels` whole pixels, one per stride at a hashed
+/// place in it, which makes lining up with a row's column pattern unlikely
+/// (not impossible); the last stride may be partial and is sampled too.
+fn sample_positions(len: usize, channels: usize) -> impl Iterator<Item = usize> {
+    let pixels = (SAMPLES / channels.max(1)).max(1);
+    let step = len.div_ceil(pixels).max(1);
+    (0..len.div_ceil(step)).map(move |i| {
+        // splitmix64: no short period, unlike a multiplicative step.
+        let mut z = (i as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let start = i * step;
+        start + (z % (len - start).min(step) as u64) as usize
+    })
+}
+
+impl Scale {
+    /// The scale of `pixels`, whose first `channels` entries are decoded.
+    fn of(pixels: &[[f32; 3]], channels: usize, grey: bool) -> Scale {
+        let channels = channels.clamp(1, 3);
+        let (mut min, mut max, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0f64);
+        let (mut nonzero, mut finite) = (0, 0);
+        for &v in pixels.iter().flat_map(|p| &p[..channels]) {
+            if v.is_finite() {
+                (min, max) = (min.min(v), max.max(v));
+                sum += f64::from(v);
+                finite += 1;
+                nonzero += usize::from(v != 0.0);
+            }
+        }
+        if finite == 0 {
+            (min, max) = (0.0, 0.0);
+        }
+        let mut sample: Vec<f32> = sample_positions(pixels.len(), channels)
+            .flat_map(|i| pixels[i][..channels].iter().copied())
+            .filter(|v| v.is_finite())
+            .collect();
+        let mut at = |q: f64| {
+            if sample.is_empty() {
+                return 0.0;
+            }
+            let i = ((sample.len() - 1) as f64 * q).round() as usize;
+            *sample.select_nth_unstable_by(i, f32::total_cmp).1
+        };
+        let (mut low, mut high) = (if grey { at(0.001) } else { 0.0 }, at(0.999));
+        if high <= low {
+            (low, high) = (min, max);
+            if !grey && min >= 0.0 {
+                low = 0.0;
+            }
+        }
+        Scale {
+            low,
+            high,
+            max,
+            nonzero,
+            finite,
+            mean: if finite == 0 {
+                0.0
+            } else {
+                sum / finite as f64
+            },
+        }
+    }
+
+    /// A channel value as 0..255 (computed in f64, so even the widest
+    /// finite range keeps its ends apart; non-finite is 0; with a flat
+    /// range, 0 and below are 0 and the rest 255).
+    fn byte(&self, v: f32) -> u8 {
+        if !v.is_finite() {
+            return 0;
+        }
+        let range = f64::from(self.high) - f64::from(self.low);
+        if range <= 0.0 {
+            return if v > 0.0 { 255 } else { 0 };
+        }
+        ((f64::from(v) - f64::from(self.low)) / range * 255.0).clamp(0.0, 255.0) as u8
+    }
 }
 
 /// Pixels per side of the grid [`probe`] reads.
@@ -566,6 +693,144 @@ static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::Scale;
+
+    fn colour(values: impl Iterator<Item = f32>) -> Vec<[f32; 3]> {
+        values.map(|v| [v, v, v]).collect()
+    }
+
+    #[test]
+    fn one_hot_pixel_does_not_set_the_scale() {
+        // A lit target: 10,000 pixels around 1.0 and one light at 11,088.
+        let values = (0..10_000).map(|i| 0.5 + (i % 100) as f32 / 100.0);
+        let pixels = colour(values.chain([11_088.0]));
+        let s = Scale::of(&pixels, 3, false);
+        assert_eq!((s.low, s.max), (0.0, 11_088.0));
+        assert!(
+            s.high < 1.5,
+            "high {} follows the bulk, not the light",
+            s.high
+        );
+        assert_eq!((s.nonzero, s.finite), (30_003, 30_003));
+        assert_eq!(s.byte(11_088.0), 255);
+        assert!(s.byte(1.0) > 150);
+    }
+
+    #[test]
+    fn a_strided_sample_keeps_every_channel() {
+        // More values than SAMPLES, so the sample strides: a uniform
+        // (1, 10, 100) must still scale to its blue channel.
+        let pixels = vec![[1.0, 10.0, 100.0]; super::SAMPLES];
+        let s = Scale::of(&pixels, 3, false);
+        assert_eq!((s.low, s.high), (0.0, 100.0));
+        assert_eq!([1.0, 10.0, 100.0].map(|c| s.byte(c)), [2, 25, 255]);
+    }
+
+    #[test]
+    fn a_stride_dividing_the_row_still_sees_every_column() {
+        // Alternating columns of 1 and 100, twice SAMPLES pixels: a stride
+        // of 6 pixels, which without jitter would see the 1s only.
+        let pixels: Vec<[f32; 3]> = (0..2 * super::SAMPLES)
+            .map(|i| [if i % 2 == 0 { 1.0 } else { 100.0 }; 3])
+            .collect();
+        let s = Scale::of(&pixels, 3, false);
+        assert_eq!(s.high, 100.0);
+        assert!(s.byte(1.0) < 10);
+    }
+
+    #[test]
+    fn sample_positions_stay_in_range_and_within_the_cap() {
+        use super::{SAMPLES, sample_positions};
+        for (len, channels) in [(0, 3), (1, 3), (1 << 20, 3), (2048 * 2560, 3), (12_345, 1)] {
+            let at: Vec<usize> = sample_positions(len, channels).collect();
+            assert!(at.iter().all(|&i| i < len), "{len}");
+            assert!(at.len() * channels <= SAMPLES, "{len}: {}", at.len());
+            assert!(
+                at.windows(2).all(|w| w[0] < w[1]),
+                "{len}: in order, once each"
+            );
+            if len > 0 {
+                assert!(!at.is_empty());
+            }
+        }
+        // A partial last stride (349,525 pixels a stride of 3 apart, one
+        // left over) is sampled too: only one place in it.
+        let at: Vec<usize> = sample_positions(699_052, 3).collect();
+        assert_eq!(at.last(), Some(&699_051));
+        assert!(at.len() * 3 <= SAMPLES);
+    }
+
+    #[test]
+    fn the_jitter_does_not_repeat_along_a_row() {
+        // 512 x 1024 RGB: a stride of 2 pixels, a row every 256 strides. A
+        // jitter that repeats each row samples the same 256 columns only.
+        let (w, h) = (512, 1024);
+        let mut columns: Vec<usize> = super::sample_positions(w * h, 3).map(|i| i % w).collect();
+        columns.sort_unstable();
+        columns.dedup();
+        assert!(
+            columns.len() > 500,
+            "{} of {w} columns sampled",
+            columns.len()
+        );
+    }
+
+    #[test]
+    fn padding_channels_are_not_counted() {
+        // RG: the decoder fills blue with 0.
+        let pixels = vec![[2.0, 4.0, 0.0]; 1000];
+        let s = Scale::of(&pixels, 2, false);
+        assert_eq!((s.finite, s.nonzero, s.mean), (2000, 2000, 3.0));
+        // Grey: one value, repeated in all three.
+        let s = Scale::of(&[[5.0; 3]; 10], 1, true);
+        assert_eq!((s.finite, s.mean), (10, 5.0));
+    }
+
+    #[test]
+    fn a_few_lit_pixels_on_black_still_show() {
+        // 99.95% zero: the 99.9th percentile is 0, so the maximum is used.
+        let values = std::iter::repeat_n(0.0, 19_990).chain(std::iter::repeat_n(7.0, 10));
+        let s = Scale::of(&colour(values), 3, false);
+        assert_eq!((s.low, s.high, s.nonzero), (0.0, 7.0, 30));
+        assert_eq!((s.byte(0.0), s.byte(7.0)), (0, 255));
+    }
+
+    #[test]
+    fn single_channels_drop_the_outer_tenth_of_a_percent() {
+        let values = (0..10_000)
+            .map(|i| 0.4 + (i % 1000) as f32 / 5000.0)
+            .chain([-1e30, 1e30, f32::NAN, f32::INFINITY]);
+        let s = Scale::of(&colour(values), 1, true);
+        assert!(s.low >= 0.4 && s.high <= 0.6, "{} .. {}", s.low, s.high);
+        assert_eq!((s.max, s.finite), (1e30, 10_002));
+        assert_eq!((s.byte(f32::NAN), s.byte(f32::INFINITY)), (0, 0));
+    }
+
+    #[test]
+    fn negative_and_extreme_ranges_still_map() {
+        // All-negative colour: min..max, not 0..(a negative high).
+        let s = Scale::of(&colour([-4.0, -2.0].into_iter()), 3, false);
+        assert_eq!((s.low, s.high), (-4.0, -2.0));
+        assert_eq!((s.byte(-4.0), s.byte(-2.0)), (0, 255));
+        // The widest finite range keeps its ends apart (f32 would overflow).
+        let s = Scale::of(&colour([-f32::MAX, f32::MAX].into_iter()), 1, true);
+        assert_eq!((s.byte(-f32::MAX), s.byte(f32::MAX)), (0, 255));
+    }
+
+    #[test]
+    fn an_empty_or_flat_target_has_a_range() {
+        let s = Scale::of(&[], 3, false);
+        assert_eq!((s.low, s.high, s.max, s.finite), (0.0, 0.0, 0.0, 0));
+        // A target cleared to 0 is black, not white.
+        let s = Scale::of(&[[0.0; 3]; 100], 3, false);
+        assert_eq!((s.nonzero, s.byte(0.0)), (0, 0));
+        let s = Scale::of(&[[3.0; 3]; 100], 1, true);
+        assert_eq!((s.low, s.high, s.mean), (3.0, 3.0, 3.0));
+    }
 }
 
 #[cfg(test)]
