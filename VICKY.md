@@ -14,7 +14,9 @@ VIcky is a **research fork of [VIctory](https://github.com/Marvisak/VIctory)**. 
 | Mirror 256-byte-aligned CBV tables in place, so the dynamic descriptor slots are not used up (VIctory #840) | alessiodeia `1d21e06` |
 | Logs which texture each present plane comes from, for listed frames | fuzeofficlal `9a10d7a` |
 | Capture frames by run time (`VICTORY_CAPTURE_AT_SECS`), and trace every draw and dispatch of a captured frame with its programs and the reason it was dropped | this fork |
-| Guess the stride of bindless structured buffers: the smallest stride the shader declares that holds every access, at constant offsets (`VICTORY_COMBO_GUESS_STRIDE=0` turns it off, `=any` drops the check). It unblocks 39 of 81 failing compute programs, among them the instance culling | this fork (#1) |
+| Guess the stride of bindless structured buffers, from accesses at constant offsets. A record read whole up to a 16-byte multiple keeps that size; otherwise the stride is the smallest one the shader declares that holds every access. `VICTORY_COMBO_GUESS_STRIDE=0` turns it off; `=any` takes the extent as is. It unblocks 41 of 81 failing compute programs, among them the instance culling | this fork (#1) |
+| Typeless views on typeless textures take the family's first concrete format | port of Xvania7's VIctory #876 |
+| Mesh output bounds, every primitive initialised | integration update 6 (VIctory #587) |
 | An empty buffer view, or one that runs past its host copy, becomes a null view instead of removing the device | this fork |
 | `VICTORY_DUMP_FAILED_SHADERS=<folder>` keeps the containers of shaders that do not translate, for `victory shader-info --disasm`. They are title data: keep them local | this fork |
 
@@ -43,7 +45,8 @@ With `VICTORY_SHADER_LOOP_LIMIT=32`, testers report no device removal on several
 Measured on an RTX 4080 (Windows 11), in diagnostics builds of this tree, unless a line says otherwise.
 
 - **The world loads and runs at about 1 frame per second.** About 930–980 draws and dispatches per frame are dropped, of about 2,150; about 250 of those are only waiting for their pipelines to compile. The UI, subtitles and the loading art all render.
-- **Latest (stride guess + view guard): instance culling runs.** Dropped draws went from ~950 to ~565 per frame, and about 2,550 now run. The G-buffer shows recognisable objects (a picnic table, a chair, a lamp, a basketball hoop). It is also crossed by long thin lines: triangles whose vertices fly off, so some meshes get wrong positions. That's next. No device removal in 5 minutes.
+- **Latest:** compute `f0afa89ecfb6944e` caused the long thin lines. Found by elimination over the 38 programs the guess unblocked: it read a 128-byte record with a guessed stride of 136, a size the shader declares for another resource. With the 16-byte rule, the lines are gone and there is no device removal in 4 min 40 s. About 2,550 draws per frame run and about 560 are dropped. The HDR / lighting targets are still black (issue #2).
+- **Earlier (stride guess + view guard): instance culling runs.** Dropped draws went from ~950 to ~565 per frame, and about 2,550 now run. The G-buffer shows recognisable objects (a picnic table, a chair, a lamp, a basketball hoop). It is also crossed by long thin lines: triangles whose vertices fly off, so some meshes get wrong positions. That's next. No device removal in 5 minutes.
 - **Before that: the G-buffer was partly drawn.** In a world frame (a cutscene), the 2560x1440 G-buffer targets hold some geometry: curtains, a roof, plates, a light shaft. It is striped and noisy, and much of the scene is missing. The depth target matches.
 - **Every HDR / lighting target is black.** The post-process output is a flat colour, which is why the screen is grey. So the first link that breaks is lighting, right after the G-buffer.
 - **The traced world frame (frame 2514, about 4,500 draws and dispatches) shows where the breaks are:**

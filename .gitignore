@@ -76,3 +76,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# combo: a second build directory for diagnostics builds
+/target-*/

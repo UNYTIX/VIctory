@@ -4229,14 +4229,26 @@ impl<'a> Lower<'a> {
         if std::env::var("VICTORY_COMBO_GUESS_STRIDE").is_ok_and(|v| v.trim() == "any") {
             return extent.next_multiple_of(4);
         }
-        self.x
+        // a record read whole up to a 16-byte multiple is that long: a declared
+        // stride a few bytes longer belongs to another resource (136 for 128
+        // bytes read sent compute f0afa89ecfb6944e's vertices flying)
+        if extent.is_multiple_of(16) {
+            return extent;
+        }
+        let chosen = self
+            .x
             .native
             .used
             .iter()
             .map(|u| u.stride)
             .filter(|&s| s >= extent && s - extent <= 16 && s.is_multiple_of(4))
             .min()
-            .unwrap_or(known)
+            .unwrap_or(known);
+        if std::env::var_os("VICTORY_DEBUG_STRIDE").is_some() {
+            let declared: Vec<u32> = self.x.native.used.iter().map(|u| u.stride).collect();
+            eprintln!("STRIDE GUESS extent={extent} chosen={chosen} declared={declared:?}");
+        }
+        chosen
     }
 
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
