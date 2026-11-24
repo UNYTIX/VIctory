@@ -254,7 +254,9 @@ pub(crate) fn save_read_back(
 /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
 /// (what each holds at the end of the frame; formats normalized to show
-/// structure: floats scaled by their largest value, depth by its range).
+/// structure: floats scaled by their 99.9th percentile, depth by its range
+/// without the outer 0.1% on each side; see [`Scale`]). Each is logged first
+/// as `target values`, with its true maximum and how much of it is non-zero.
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
@@ -368,9 +370,8 @@ fn small_float(bits: u32, man: u32) -> f32 {
 }
 
 /// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
-/// as channel values scaled so the largest finite one is white (single
-/// channels: lowest black, highest white, as grey). `None` for formats not
-/// handled.
+/// as channel values scaled by [`Scale`] (single channels as grey). `None`
+/// for formats not handled.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
@@ -427,19 +428,87 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
     let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
-    let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
-    let (low, high) = if grey {
-        finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
-    } else {
-        (0.0, finite.fold(0.0f32, f32::max))
-    };
-    let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high, "target values");
+    let s = Scale::of(values.iter().flatten().copied(), grey);
+    tracing::info!(
+        format,
+        low = s.low,
+        high = s.high,
+        max = s.max,
+        nonzero = s.nonzero,
+        finite = s.finite,
+        mean = s.mean,
+        "target values"
+    );
+    let (low, range) = (s.low, (s.high - s.low).max(1e-20));
     for v in values {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
+}
+
+/// How a float target's values map to 0..255 in its dump. Scaling by the
+/// largest value let one hot pixel (a light source at thousands) turn a lit
+/// HDR target black, so the 99.9th percentile is white and the brightest
+/// 0.1% saturate. If that percentile is 0 while some values are not, the
+/// maximum is used, so a target with only a few lit pixels still shows them.
+/// Single channels (`grey`, depth among them) map the 0.1st to the 99.9th
+/// percentile; colour starts at 0. Percentiles come from at most [`SAMPLES`]
+/// evenly spaced values.
+#[derive(Debug, PartialEq)]
+struct Scale {
+    low: f32,
+    high: f32,
+    /// The largest finite value.
+    max: f32,
+    /// Finite values that are not 0, and all finite values.
+    nonzero: usize,
+    finite: usize,
+    /// Over the finite values.
+    mean: f64,
+}
+
+/// Values the percentiles of a [`Scale`] are taken from at most.
+const SAMPLES: usize = 1 << 20;
+
+impl Scale {
+    fn of(values: impl Iterator<Item = f32>, grey: bool) -> Scale {
+        let finite: Vec<f32> = values.filter(|v| v.is_finite()).collect();
+        let (mut min, mut max, mut sum, mut nonzero) = (f32::MAX, f32::MIN, 0f64, 0);
+        for &v in &finite {
+            (min, max) = (min.min(v), max.max(v));
+            sum += f64::from(v);
+            nonzero += usize::from(v != 0.0);
+        }
+        if finite.is_empty() {
+            (min, max) = (0.0, 0.0);
+        }
+        let step = finite.len().div_ceil(SAMPLES).max(1);
+        let mut sample: Vec<f32> = finite.iter().step_by(step).copied().collect();
+        let mut at = |q: f64| {
+            if sample.is_empty() {
+                return 0.0;
+            }
+            let i = ((sample.len() - 1) as f64 * q).round() as usize;
+            *sample.select_nth_unstable_by(i, f32::total_cmp).1
+        };
+        let (mut low, mut high) = (if grey { at(0.001) } else { 0.0 }, at(0.999));
+        if high <= low {
+            (low, high) = (if grey { min } else { 0.0 }, max);
+        }
+        Scale {
+            low,
+            high,
+            max,
+            nonzero,
+            finite: finite.len(),
+            mean: if finite.is_empty() {
+                0.0
+            } else {
+                sum / finite.len() as f64
+            },
+        }
+    }
 }
 
 /// Pixels per side of the grid [`probe`] reads.
@@ -566,6 +635,48 @@ static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::Scale;
+
+    #[test]
+    fn one_hot_pixel_does_not_set_the_scale() {
+        // A lit target: 10,000 values around 1.0 and one light at 11,088.
+        let values = (0..10_000).map(|i| 0.5 + (i % 100) as f32 / 100.0).chain([11_088.0]);
+        let s = Scale::of(values, false);
+        assert_eq!((s.low, s.max), (0.0, 11_088.0));
+        assert!(s.high < 1.5, "high {} follows the bulk, not the light", s.high);
+        assert_eq!((s.nonzero, s.finite), (10_001, 10_001));
+    }
+
+    #[test]
+    fn a_few_lit_pixels_on_black_still_show() {
+        // 99.95% zero: the 99.9th percentile is 0, so the maximum is used.
+        let values = std::iter::repeat_n(0.0, 19_990).chain(std::iter::repeat_n(7.0, 10));
+        let s = Scale::of(values, false);
+        assert_eq!((s.low, s.high, s.nonzero), (0.0, 7.0, 10));
+    }
+
+    #[test]
+    fn single_channels_drop_the_outer_tenth_of_a_percent() {
+        // Depth-like: most at 0.4-0.6, a few far values at both ends.
+        let values = (0..10_000)
+            .map(|i| 0.4 + (i % 1000) as f32 / 5000.0)
+            .chain([-1e30, 1e30, f32::NAN, f32::INFINITY]);
+        let s = Scale::of(values, true);
+        assert!(s.low >= 0.4 && s.high <= 0.6, "{} .. {}", s.low, s.high);
+        assert_eq!((s.max, s.finite), (1e30, 10_002));
+    }
+
+    #[test]
+    fn an_empty_or_flat_target_has_a_range() {
+        let s = Scale::of(std::iter::empty(), false);
+        assert_eq!((s.low, s.high, s.max, s.finite), (0.0, 0.0, 0.0, 0));
+        let s = Scale::of(std::iter::repeat_n(3.0, 100), true);
+        assert_eq!((s.low, s.high, s.mean), (3.0, 3.0, 3.0));
+    }
 }
 
 #[cfg(test)]
