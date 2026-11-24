@@ -1,5 +1,9 @@
 # VIctory
 
+> **VIcky** is a research fork of VIctory to find why the world renders black; see
+> **[VICKY.md](VICKY.md)** for what is in this tree, its diagnostics and the findings so far.
+
+
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
