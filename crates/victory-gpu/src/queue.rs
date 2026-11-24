@@ -232,6 +232,26 @@ fn system_timestamp() -> u64 {
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "diagnostics")]
+/// VIcky: `VICTORY_SHOW_GBUFFER=<n>` presents render target `n` (default 1) of the
+/// draws that write four or more targets at once (the G-buffer) instead of the
+/// title's picture: the world in flat, unlit colours while its lighting is
+/// black. A debug view, not the title's output.
+pub(crate) fn gbuffer_index() -> Option<usize> {
+    static INDEX: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *INDEX.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHOW_GBUFFER").ok()?;
+        let k = v.trim().parse().unwrap_or(1);
+        tracing::info!(target = k, "VIcky: presenting a G-buffer target instead of the title's picture");
+        Some(k)
+    })
+}
+
+static GBUFFER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn note_gbuffer(resource: usize) {
+    GBUFFER.store(resource, Ordering::Relaxed);
+}
+
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -319,6 +339,16 @@ extern "system" fn present(
         #[cfg(feature = "diagnostics")]
         if listed {
             tracing::info!(frame, planes, sources = resources.len(), "present plane selection");
+        }
+        // VIcky: the G-buffer view in place of the title's picture
+        if gbuffer_index().is_some() {
+            let g = GBUFFER.load(Ordering::Relaxed) as This;
+            if !g.is_null()
+                && let Some(texture) = crate::resource::host_resource(g)
+            {
+                let state = crate::resource::host_transition(g, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+                resources = vec![(g, texture, state)];
+            }
         }
         if !resources.is_empty() {
             let sources: Vec<(&_, u32)> = resources

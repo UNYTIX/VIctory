@@ -403,6 +403,13 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        // VIcky: the G-buffer's colour target, for `VICTORY_SHOW_GBUFFER`
+        if self.targets.len() >= 4
+            && let Some(k) = crate::queue::gbuffer_index()
+            && let Some(&t) = self.targets.get(k)
+        {
+            crate::queue::note_gbuffer(t);
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
