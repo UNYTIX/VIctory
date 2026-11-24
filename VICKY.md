@@ -14,6 +14,9 @@ VIcky is a **research fork of [VIctory](https://github.com/Marvisak/VIctory)**. 
 | Mirror 256-byte-aligned CBV tables in place, so the dynamic descriptor slots are not used up (VIctory #840) | alessiodeia `1d21e06` |
 | Logs which texture each present plane comes from, for listed frames | fuzeofficlal `9a10d7a` |
 | Capture frames by run time (`VICTORY_CAPTURE_AT_SECS`), and trace every draw and dispatch of a captured frame with its programs and the reason it was dropped | this fork |
+| Guess the stride of bindless structured buffers: the smallest stride the shader declares that holds every access, at constant offsets (`VICTORY_COMBO_GUESS_STRIDE=0` turns it off, `=any` drops the check). It unblocks 39 of 81 failing compute programs, among them the instance culling | this fork (#1) |
+| An empty buffer view, or one that runs past its host copy, becomes a null view instead of removing the device | this fork |
+| `VICTORY_DUMP_FAILED_SHADERS=<folder>` keeps the containers of shaders that do not translate, for `victory shader-info --disasm`. They are title data: keep them local | this fork |
 
 ## Build and run
 
@@ -40,7 +43,8 @@ With `VICTORY_SHADER_LOOP_LIMIT=32`, testers report no device removal on several
 Measured on an RTX 4080 (Windows 11), in diagnostics builds of this tree, unless a line says otherwise.
 
 - **The world loads and runs at about 1 frame per second.** About 930–980 draws and dispatches per frame are dropped, of about 2,150; about 250 of those are only waiting for their pipelines to compile. The UI, subtitles and the loading art all render.
-- **The G-buffer is partly drawn.** In a world frame (a cutscene), the 2560x1440 G-buffer targets hold some geometry: curtains, a roof, plates, a light shaft. It is striped and noisy, and much of the scene is missing. The depth target matches.
+- **Latest (stride guess + view guard): instance culling runs.** Dropped draws went from ~950 to ~565 per frame, and about 2,550 now run. The G-buffer shows recognisable objects (a picnic table, a chair, a lamp, a basketball hoop). It is also crossed by long thin lines: triangles whose vertices fly off, so some meshes get wrong positions. That's next. No device removal in 5 minutes.
+- **Before that: the G-buffer was partly drawn.** In a world frame (a cutscene), the 2560x1440 G-buffer targets hold some geometry: curtains, a roof, plates, a light shaft. It is striped and noisy, and much of the scene is missing. The depth target matches.
 - **Every HDR / lighting target is black.** The post-process output is a flat colour, which is why the screen is grey. So the first link that breaks is lighting, right after the G-buffer.
 - **The traced world frame (frame 2514, about 4,500 draws and dispatches) shows where the breaks are:**
   - **Instance culling.** Compute `e30970f1727063fd` is `MISSING` (a structured buffer of unknown stride) **321 times per frame**. It sits between the G-buffer's mesh draws, alternating with computes `1ea7e2dbf731c8dc` and `4115dd63f99a09d7`: the GPU-driven culling that picks what the next mesh draws draw. Without it most objects are never drawn. VIctory's INTEGRATION.md names the same unknown-stride stop for the four instance-culling programs of VIctory #71.
@@ -56,6 +60,11 @@ Measured on an RTX 4080 (Windows 11), in diagnostics builds of this tree, unless
   - a structured buffer of unknown stride;
   - a lane mask read as data.
 - **Descriptor heap.** The title's view heap has 1,245,184 slots; NVIDIA caps a shader-visible heap at 1,000,000. The title never reaches its upper slots in our runs.
+- **RAM, not VRAM, runs out.** On a 31 GB machine the process committed 25.6 GB, and 1.5 GB were left free.
+  - The title's memory lives in system RAM, including its streaming pool of about 6 GB.
+  - Each buffer the GPU reads has a host copy, also in system memory (`shadow.rs`). Ranges that shaders write are also snapshotted per submission.
+  - Pipelines compile in the background: 1,000+ of them on a first run with a new build.
+  - Ideas: use the title's memory in place (below); put GPU-only buffers in video memory.
 - **Memory-copy cost (about 2/3 of a frame).** Experiments, not in this tree yet:
   - A pagefile section created with `SEC_COMMIT` and smaller than 4 GiB opens as a host D3D12 heap (`OpenExistingHeapFromFileMapping`). The GPU then reads and writes the title's pages directly, with no copy.
   - At 4 GiB or more, or with `SEC_RESERVE`, opening it fails.

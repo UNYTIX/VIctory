@@ -624,6 +624,16 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
+/// combo: whether a buffer view of `count` elements of `element` bytes from
+/// `first` has at least one element and lies inside `buffer`.
+fn view_fits(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> bool {
+    // SAFETY: a live resource.
+    let width = unsafe { buffer.GetDesc() }.Width;
+    count > 0
+        && element > 0
+        && first.checked_add(u64::from(count)).and_then(|e| e.checked_mul(element)).is_some_and(|end| end <= width)
+}
+
 /// Whether a raw buffer view may start at element `first` (4 bytes each):
 /// the host wants 16-byte aligned starts, the console only 4, and refuses
 /// the call (removing the device) for the rest.
@@ -708,6 +718,14 @@ fn buffer_srv(
         once!(first, "raw buffer view not on 16 bytes of its host copy");
         return None;
     }
+    // combo: a view of no elements, or past its host copy, is refused by the
+    // host with the device removed (a title view of 0 elements, reached once
+    // more shaders translate): a null view instead
+    let elem = if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 { 4 } else { element };
+    if !view_fits(&shadow.buffer, buffer.FirstElement, buffer.NumElements, elem) {
+        once!("buffer view of no elements or past its host copy made null");
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -779,6 +797,20 @@ fn buffer_uav(
             first,
             "raw unordered buffer view not on 16 bytes of its host copy"
         );
+        return None;
+    }
+    // combo: as in `buffer_srv` – a view of no elements or past its host copy
+    // removes the device (StructureByteStride 16, FirstElement 2703504,
+    // NumElements 0 in the world)
+    let elem = if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        4
+    } else if buffer.StructureByteStride > 0 {
+        u64::from(buffer.StructureByteStride)
+    } else {
+        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    };
+    if !view_fits(&shadow.buffer, buffer.FirstElement, buffer.NumElements, elem) {
+        once!("unordered buffer view of no elements or past its host copy made null");
         return None;
     }
     let host = host()?;

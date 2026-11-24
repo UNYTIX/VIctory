@@ -3788,7 +3788,7 @@ impl<'a> Lower<'a> {
                     ((kind | u, 0x409), Some(kind))
                 }
                 Fields::Buffer { idxen, format, .. } => {
-                    let stride = used.map_or(0, |u| u.stride);
+                    let stride = self.structured_stride(&src, used);
                     let props = if un.starts_with("buffer_load_format")
                         || un.starts_with("buffer_store_format")
                     {
@@ -4146,6 +4146,67 @@ impl<'a> Lower<'a> {
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
+    /// The stride of a structured access through `src`: the console's
+    /// used-resource table's, else (combo, local research build) one guessed
+    /// for a descriptor the shader takes from the resource heap by a dynamic
+    /// index (bindless; the console reads its stride from the descriptor at
+    /// run time, which the used-resource table does not cover): the extent of
+    /// every access through that descriptor in the program, when all of them
+    /// are at constant offsets (Grand Theft Auto VI's instance culling writes
+    /// two 16-byte halves of 32-byte records). `VICTORY_COMBO_GUESS_STRIDE=0`
+    /// refuses as before. 0: unknown.
+    fn structured_stride(&self, src: &Source, used: Option<&UsedResource>) -> u32 {
+        let known = used.map_or(0, |u| u.stride);
+        if known >= 4 && known.is_multiple_of(4) {
+            return known;
+        }
+        if std::env::var("VICTORY_COMBO_GUESS_STRIDE").is_ok_and(|v| v.trim() == "0") {
+            return known;
+        }
+        let Source::Loaded { load, .. } = src else { return known };
+        let from_heap = self
+            .scalar
+            .get(load)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|rp| rp.root == RootType::ResourceHeap);
+        if !from_heap {
+            return known;
+        }
+        let mut extent = 0u32;
+        for (b, block) in self.x.p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let Fields::Buffer { offset, offen, .. } = &inst.fields else { continue };
+                if self.descriptors.get(&((b, i), false)).is_none_or(|d| *d != src) {
+                    continue;
+                }
+                let Some(bytes) = buffer_access_bytes(inst.name()) else { return known };
+                if *offen {
+                    return known; // an offset from a VGPR: the record's size is not seen
+                }
+                extent = extent.max(u32::from(*offset) + bytes);
+            }
+        }
+        // the smallest size the shader declares for one of its own structured
+        // resources that holds every access (its last bytes may go untouched:
+        // 60 bytes read of a 64-byte record), at most 16 bytes past them; a
+        // record larger than that would get a wrong stride (a wrong guess fed
+        // an indirect dispatch garbage and removed the device)
+        if !(4..=2048).contains(&extent) {
+            return known;
+        }
+        if std::env::var("VICTORY_COMBO_GUESS_STRIDE").is_ok_and(|v| v.trim() == "any") {
+            return extent.next_multiple_of(4);
+        }
+        self.x
+            .native
+            .used
+            .iter()
+            .map(|u| u.stride)
+            .filter(|&s| s >= extent && s - extent <= 16 && s.is_multiple_of(4))
+            .min()
+            .unwrap_or(known)
+    }
+
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
             src
@@ -7713,7 +7774,7 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
+                    let stride = self.structured_stride(src, used);
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
@@ -7796,7 +7857,7 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
+                        let stride = self.structured_stride(src, used);
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
@@ -7861,7 +7922,7 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
+                    let stride = self.structured_stride(src, used);
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
@@ -9253,4 +9314,20 @@ mod select_tests {
             }
         }
     }
+}
+
+/// Bytes an untyped buffer load, store or atomic moves (None for typed or
+/// format accesses).
+fn buffer_access_bytes(name: &str) -> Option<u32> {
+    if let Some(op) = name.strip_prefix("buffer_atomic_") {
+        return Some(if op.ends_with("_x2") { 8 } else { 4 });
+    }
+    let rest = name.strip_prefix("buffer_load_").or(name.strip_prefix("buffer_store_"))?;
+    Some(match rest {
+        "dword" => 4,
+        "dwordx2" => 8,
+        "dwordx3" => 12,
+        "dwordx4" => 16,
+        _ => return None,
+    })
 }

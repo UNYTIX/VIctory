@@ -122,12 +122,22 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
+                    Err(e) => {
+                        // combo (local): `VICTORY_DUMP_FAILED_SHADERS=<folder>` keeps the
+                        // container of each shader that does not translate there, for
+                        // `victory shader-info --disasm` (title data: never commit it)
+                        if let Some(dir) = std::env::var_os("VICTORY_DUMP_FAILED_SHADERS") {
+                            let path = std::path::Path::new(&dir).join(format!("{}-{}.bin", self.stage, self.hash));
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(path, &self.container[..]);
+                        }
+                        tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
                         error = %e,
                         "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                        );
+                    }
                 }
                 done.ok()
             })
