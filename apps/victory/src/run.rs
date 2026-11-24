@@ -180,8 +180,7 @@ fn watch(base: usize, size: usize) {
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
-#[cfg(windows)]
-fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
+pub(crate) fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
