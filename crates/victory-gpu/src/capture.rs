@@ -448,7 +448,11 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         "target values"
     );
     for v in values {
-        let c = v.map(|c| s.byte(c));
+        let c = if grey {
+            [s.byte(v[0]); 3]
+        } else {
+            [0, 1, 2].map(|k| if k < channels { s.byte(v[k]) } else { 0 })
+        };
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
@@ -460,20 +464,22 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
 /// the channel values, and single channels (`grey`, depth among them) from
 /// about the 0.1st to the 99.9th; values outside saturate. Where that range is
 /// empty (most of the target 0, or all of it negative), the minimum to the
-/// maximum is used instead. Percentiles come from whole pixels at an even
-/// stride, at most [`SAMPLES`] values; counts, maximum and mean cover every
-/// pixel's real channels (not a decoder's padding). Non-finite values are
-/// left out of all of it and dumped black.
+/// maximum is used instead; a flat target is black at 0 or below and white
+/// above. Percentiles come from whole pixels, one per stride at a jittered
+/// place in it (so a stride cannot follow a column pattern), at most
+/// [`SAMPLES`] values. Counts, maximum and mean cover every pixel's decoded
+/// channels (not a decoder's padding; alpha is not decoded). Non-finite
+/// values are left out of all of it and dumped black.
 #[derive(Debug, PartialEq)]
 struct Scale {
     low: f32,
     high: f32,
     /// The largest finite value.
     max: f32,
-    /// Finite channel values that are not 0, and all finite channel values.
+    /// Finite decoded values that are not 0, and all finite decoded values.
     nonzero: usize,
     finite: usize,
-    /// Over the finite channel values (approximate where they cancel).
+    /// Over the finite decoded values (approximate where they cancel).
     mean: f64,
 }
 
@@ -481,7 +487,7 @@ struct Scale {
 const SAMPLES: usize = 1 << 20;
 
 impl Scale {
-    /// The scale of `pixels`, whose first `channels` entries are real.
+    /// The scale of `pixels`, whose first `channels` entries are decoded.
     fn of(pixels: &[[f32; 3]], channels: usize, grey: bool) -> Scale {
         let channels = channels.clamp(1, 3);
         let (mut min, mut max, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0f64);
@@ -497,13 +503,16 @@ impl Scale {
         if finite == 0 {
             (min, max) = (0.0, 0.0);
         }
-        // Whole pixels, so a stride never lands on one channel only.
+        // Whole pixels, so a stride never lands on one channel only, each at
+        // a jittered place in its stride, so a stride that divides a row
+        // cannot sample one column pattern only.
         let step = (pixels.len() * channels).div_ceil(SAMPLES).max(1);
-        let mut sample: Vec<f32> = pixels
-            .iter()
-            .step_by(step)
+        let jitter = |i: usize| (i.wrapping_mul(2_654_435_761) >> 7) % step;
+        let mut sample: Vec<f32> = (0..pixels.len().div_ceil(step))
+            .filter_map(|i| pixels.get(i * step + jitter(i)))
             .flat_map(|p| p[..channels].iter().copied())
             .filter(|v| v.is_finite())
+            .take(SAMPLES)
             .collect();
         let mut at = |q: f64| {
             if sample.is_empty() {
@@ -534,14 +543,15 @@ impl Scale {
     }
 
     /// A channel value as 0..255 (computed in f64, so even the widest
-    /// finite range keeps its ends apart; non-finite is 0).
+    /// finite range keeps its ends apart; non-finite is 0; with a flat
+    /// range, 0 and below are 0 and the rest 255).
     fn byte(&self, v: f32) -> u8 {
         if !v.is_finite() {
             return 0;
         }
         let range = f64::from(self.high) - f64::from(self.low);
         if range <= 0.0 {
-            return if v >= self.high { 255 } else { 0 };
+            return if v > 0.0 { 255 } else { 0 };
         }
         ((f64::from(v) - f64::from(self.low)) / range * 255.0).clamp(0.0, 255.0) as u8
     }
@@ -709,6 +719,28 @@ mod scale_tests {
     }
 
     #[test]
+    fn a_stride_dividing_the_row_still_sees_every_column() {
+        // Alternating columns of 1 and 100, twice SAMPLES pixels: a stride
+        // of 6 pixels, which without jitter would see the 1s only.
+        let pixels: Vec<[f32; 3]> = (0..2 * super::SAMPLES)
+            .map(|i| [if i % 2 == 0 { 1.0 } else { 100.0 }; 3])
+            .collect();
+        let s = Scale::of(&pixels, 3, false);
+        assert_eq!(s.high, 100.0);
+        assert!(s.byte(1.0) < 10);
+    }
+
+    #[test]
+    fn the_sample_stays_within_its_cap() {
+        // 1024 x 1024 with three channels: a stride of 3 pixels.
+        let pixels = vec![[1.0f32; 3]; 1 << 20];
+        let step = (pixels.len() * 3).div_ceil(super::SAMPLES);
+        assert_eq!(step, 3);
+        let s = Scale::of(&pixels, 3, false);
+        assert_eq!((s.finite, s.high), (3 << 20, 1.0));
+    }
+
+    #[test]
     fn padding_channels_are_not_counted() {
         // RG: the decoder fills blue with 0.
         let pixels = vec![[2.0, 4.0, 0.0]; 1000];
@@ -754,7 +786,9 @@ mod scale_tests {
     fn an_empty_or_flat_target_has_a_range() {
         let s = Scale::of(&[], 3, false);
         assert_eq!((s.low, s.high, s.max, s.finite), (0.0, 0.0, 0.0, 0));
-        assert_eq!(s.byte(0.0), 255);
+        // A target cleared to 0 is black, not white.
+        let s = Scale::of(&[[0.0; 3]; 100], 3, false);
+        assert_eq!((s.nonzero, s.byte(0.0)), (0, 0));
         let s = Scale::of(&[[3.0; 3]; 100], 1, true);
         assert_eq!((s.low, s.high, s.mean), (3.0, 3.0, 3.0));
     }
