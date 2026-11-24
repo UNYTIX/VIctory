@@ -21,6 +21,32 @@ turned down upstream.
 - Update 4 adds #566 (with the rest of #307) and brings the wave64 stack
   to #439's head `055aef9`.
 - Update 5 adds #453 (pixel barycentrics), with one fix commit after it.
+- Update 6 adds #587 (mesh output bounds) with tests, and the switch
+  `VICTORY_HEAP_GUARD=0`. **On AMD cards read "Known problem on AMD"
+  below before running this tree.** The base is still `main` `d2a4bae`;
+  upstream is at `ffe310e` and has merged #566 since.
+
+## Known problem on AMD (update 3 and later)
+
+A tester (nullmarsh, issue #293) reports that on an RX 9060 XT (driver
+32.0.32029.2010) the title dies about two seconds into the world with an
+access violation inside `amdxc64.dll`, in 3 of 3 runs at update 4, from
+this tree's merge of #483 (`7ef2c41`) on. With that merge reverted,
+update 5 ran 364 s in the world without a device loss. NVIDIA runs of
+this tree do not show it. The cause is not known. #483 merged another
+way onto `main` `ffe310e` ran 453 s on an RX 9070 XT with the same
+driver (h0useadv, on #483), so the suspects are what this tree's merge
+adds: the guard on #307's per-lane heap index, and where the guard slot
+sits.
+
+- **To run on AMD:** `git revert -m 1 7ef2c41` (it reverts cleanly at
+  update 5, per that report).
+- **To help find it:** one run with `VICTORY_HEAP_GUARD=0` and nothing
+  reverted. The shaders are the same; the host passes `u32::MAX` as the
+  guard, so no index is redirected. A crash that stays points at the
+  shaders' shape (the driver's compiler); one that goes points at reads
+  of the guard slot. The name of the Direct3D call in the crash's stack
+  says the same thing from the other side.
 
 ## Reports from the title
 
@@ -187,6 +213,10 @@ and the name is its author's GitHub login.
   read as values come from `SV_Barycentrics`, and interpolation with
   computed barycentrics is evaluated from the vertex values. See
   "Changes made in this branch" for the fix that follows it.
+- #587 (FibbS6), head `1052a90`: a mesh lane's vertex and primitive
+  writes are kept inside the declared maxima, primitives no lane writes
+  are culled first, and a barrier only some lanes reach is emitted
+  without the thread-group sync. See "Changes made in this branch".
 - #309 (AntoninMichelq): SGPRs reloaded from VGPR lanes are read as the
   spilled value
 - #306 (wbkepler): DXIL validator failures (signatures, PSV0,
@@ -288,6 +318,12 @@ machines with newer drivers did not show it.
   it, `cargo test` sometimes never finishes, with several GPU tests stuck
   together. On the integration machine, before #433, 4 of 12 runs of the
   shader tests hung; with it, 0 of 12 did.
+- At update 6, one run of the same command with other threads' builds
+  on the CPU (85% load): 442 passed, 2 failed, 5 ignored. The two are
+  `frame::tests::waits_end_on_ticks_and_count_frames` (a timing test)
+  and `xgamesave::tests::a_kill_at_any_step_leaves_old_or_new`; each
+  passed 3 of 3 runs on its own afterwards, and neither is in code this
+  update changes.
 - At update 5, one run of `cargo test --workspace --no-fail-fast --
   --test-threads=4` on the RTX 5070 with no other GPU work started from
   here: 442 passed, 5 ignored.
@@ -468,6 +504,17 @@ is described in its merge or fix commit.
   RTX 5070 matched values computed on the CPU. On WARP, programs with
   both a perspective and a linear `SV_Barycentrics` drew wrong values,
   and so did DXC's own module for the same shader, so that is WARP's.
+- **#587's conflict and one change to it:** its `divergent_barriers`
+  sits beside #453's `interp_mode` in `emit/lower.rs` (both kept). Its
+  fence-only barriers are not applied in the console flow of the wave64
+  stack (#233, #320, #439): there every lane of a wave runs every block,
+  so the lanes reach a barrier together and the stack relies on the
+  sync. #587 came without tests; two are added (primitives past the
+  lanes are culled first, for four pairs of lane count and maximum, each
+  validated; a barrier under a per-lane branch has mode 8 and one every
+  lane reaches mode 9), with a test-only record of a module's `dx.op`
+  calls.
+- **`VICTORY_HEAP_GUARD=0`** (`draw.rs`): see "Known problem on AMD".
 
 ## Left out on purpose
 
@@ -580,7 +627,8 @@ Please include:
   pipeline refusal**, with the shader hash from the log.
 - **Whether the world shows geometry**, in words.
 - **The variables you set**: `VICTORY_SHADER_LOOP_LIMIT`,
-  `VICTORY_SKIP_WAVE64`, `VICTORY_NO_WATCHDOG`, `VICTORY_ROOT_SRV_DIRECT`.
+  `VICTORY_SKIP_WAVE64`, `VICTORY_NO_WATCHDOG`, `VICTORY_ROOT_SRV_DIRECT`,
+  `VICTORY_HEAP_GUARD`.
 - **These log lines, if they appear**: `a root SRV not on 16 bytes reads
   zeros`, `a root SRV without a bound view heap`, `title slot past the
   host heap` (with its highest index), and the `dropped=` count of

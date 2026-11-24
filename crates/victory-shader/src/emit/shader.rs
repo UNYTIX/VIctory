@@ -53,6 +53,10 @@ pub(crate) struct Shader {
     /// Test builds: the property words of each handle annotation, in order.
     #[cfg(test)]
     pub annotations: Vec<(u32, u32)>,
+    /// Test builds: each `dx.op` call made, as its opcode and its first
+    /// argument where that is a constant.
+    #[cfg(test)]
+    calls: Vec<(u32, Option<i64>)>,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -106,6 +110,21 @@ pub(crate) fn last_summary() -> String {
     LAST.with(|l| l.borrow().clone())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// See [`last_calls`].
+    static LAST_CALLS: std::cell::RefCell<Vec<(u32, Option<i64>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test builds: the `dx.op` calls of the module this thread finished last,
+/// in the order they were made: the opcode, and the first argument where
+/// that is a constant (a barrier's mode, say).
+#[cfg(test)]
+pub(crate) fn last_calls() -> Vec<(u32, Option<i64>)> {
+    LAST_CALLS.with(|l| l.borrow().clone())
+}
+
 impl Shader {
     pub fn new(pixel: bool) -> Self {
         let mut m = Module::default();
@@ -128,6 +147,8 @@ impl Shader {
             m,
             #[cfg(test)]
             annotations: Vec::new(),
+            #[cfg(test)]
+            calls: Vec::new(),
             t: Types {
                 void,
                 i1,
@@ -194,6 +215,9 @@ impl Shader {
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+        #[cfg(test)]
+        self.calls
+            .push((opcode, args.first().and_then(|&a| self.m.known(a))));
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
         self.m.call(block, f, all)
@@ -349,6 +373,8 @@ impl Shader {
         let ops: Vec<&str> = self.ops.iter().map(String::as_str).collect();
         let summary = format!("{threads}wave size {wave}; ops: {}", ops.join(", "));
         LAST.with(|l| *l.borrow_mut() = summary);
+        #[cfg(test)]
+        LAST_CALLS.with(|l| *l.borrow_mut() = std::mem::take(&mut self.calls));
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;

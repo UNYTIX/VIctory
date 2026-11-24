@@ -1573,6 +1573,29 @@ mod tests {
         }
     }
 
+    /// More primitives declared than lanes: a lane writes its own primitive
+    /// and nothing wrote the rest, which reached the rasteriser with
+    /// whatever indices they held. Each lane now culls its primitive of
+    /// every pass over the maximum first (`emitIndices` with all indices 0),
+    /// and writes only where its index is below the maximum.
+    #[test]
+    fn mesh_primitives_past_the_lanes_are_culled_first() {
+        const EMIT_INDICES: u32 = 169;
+        // (lanes, maximum, emitIndices calls: one per pass, one for the export)
+        for (threads, max, calls) in [(64, 64, 2), (64, 256, 5), (32, 100, 5), (128, 64, 2)] {
+            let s = mesh(threads, max, 1, 1).unwrap();
+            match validated(&s.dxil) {
+                Some(r) => r.unwrap_or_else(|e| panic!("{threads} lanes, {max}: {e}")),
+                None => eprintln!("no dxil.dll; validation skipped"),
+            }
+            let n = super::shader::last_calls()
+                .iter()
+                .filter(|c| c.0 == EMIT_INDICES)
+                .count();
+            assert_eq!(n, calls, "{threads} lanes, {max} primitives");
+        }
+    }
+
     /// 128 lanes, 256 vertices and primitives, 64 vertex and 8 primitive
     /// output components: past 32 KiB even at the lane count. Still
     /// translated as before, with the maxima down to the lanes.

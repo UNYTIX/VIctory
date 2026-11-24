@@ -172,6 +172,16 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// Whether translated shaders get their heaps' guard slots (#483), so that
+/// a computed heap index at or past one reads it. With
+/// `VICTORY_HEAP_GUARD=0` they get `u32::MAX`: the same shaders, and no
+/// index is redirected. A diagnostic for a fault inside AMD's driver that a
+/// tester bisected to the merge that brought the guard into this tree.
+fn heap_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_GUARD").is_none_or(|v| v != "0"))
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -304,7 +314,13 @@ impl State {
             (h != 0)
                 .then(|| crate::descriptor::heap(h as This).host())
                 .flatten()
-                .map_or(0, |h| h.guard_slot())
+                .map_or(0, |h| {
+                    if heap_guard() {
+                        h.guard_slot()
+                    } else {
+                        u32::MAX
+                    }
+                })
         };
         match u.root {
             RootType::ResourceHeap => guard(false),
