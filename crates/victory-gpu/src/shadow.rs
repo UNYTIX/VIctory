@@ -121,16 +121,40 @@ impl Shadow {
         }
     }
 
-    /// The copy's bytes at `[address, address + len)`, cut to the buffer:
-    /// once a submission has run, what its shaders left there.
+    /// Calls `f` with the copy's bytes at `[address, address + len)`, cut to
+    /// the buffer, in order, in pieces of at most `piece` bytes (a view of a
+    /// whole heap is not copied at once). False if a piece could not be
+    /// read; `f` has then seen the pieces before it.
     ///
-    /// shortcut: read without the submitting thread's ordering, so a
-    /// submission running meanwhile can tear what is read (diagnostics only).
+    /// Copy-back cannot write the copy meanwhile (its lock is held), and the
+    /// bytes are copied by the kernel rather than read through a reference,
+    /// as a submission's refresh or the GPU may still write them.
+    /// shortcut: a submission running meanwhile can make what is read a mix
+    /// of before and after (diagnostics only).
     #[cfg(feature = "diagnostics")]
-    pub(crate) fn read(&self, address: u64, len: u64) -> Vec<u8> {
+    pub(crate) fn read_pieces(
+        &self,
+        address: u64,
+        len: u64,
+        piece: usize,
+        mut f: impl FnMut(&[u8]),
+    ) -> bool {
         let (from, to) = self.inside(address as usize, len as usize);
-        // SAFETY: `inside` keeps the range within the persistent mapping.
-        unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) }.to_vec()
+        let _copy_back = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buffer = vec![0u8; piece.max(1).min(to - from)];
+        let mut at = from;
+        while at < to {
+            let n = buffer.len().min(to - at);
+            // SAFETY: `inside` keeps `[at, at + n)` within the mapping; only
+            // its address is formed here, the kernel does the reading.
+            let src = unsafe { self.data.add(at) };
+            if !crate::host::read_into(src, &mut buffer[..n]) {
+                return false;
+            }
+            f(&buffer[..n]);
+            at += n;
+        }
+        true
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
