@@ -8726,6 +8726,17 @@ impl<'a> Lower<'a> {
                             self.s.m.undef(self.s.t.i32)
                         }
                     }
+                    // A lane mask's dword reaching a join that also takes
+                    // data: the registers are reused once the mask is dead.
+                    // shortcut: undefined on that edge, assuming the program
+                    // reads the joined value only on paths from a data edge.
+                    // (permadiego 7ab94ab)
+                    (Some(Val::Missing(_)), false)
+                        if self.x.st.masks.contains_key(&arg)
+                            || self.x.st.highs.contains_key(&arg) =>
+                    {
+                        self.s.m.undef(self.s.t.i32)
+                    }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
