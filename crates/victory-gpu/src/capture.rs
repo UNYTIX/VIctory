@@ -29,6 +29,26 @@ pub(crate) fn listed(n: u64) -> bool {
     .contains(&n)
 }
 
+/// A plane selected for this frame, with the same resource ID as its target dump.
+pub(crate) fn present_source(
+    frame: u64,
+    plane: usize,
+    composition_index: usize,
+    resource: crate::object::This,
+    desc: &D3D12_RESOURCE_DESC,
+) {
+    tracing::info!(
+        frame,
+        plane,
+        composition_index,
+        ?resource,
+        width = desc.Width,
+        height = desc.Height,
+        format = desc.Format.0,
+        "present source"
+    );
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
     folder().is_some() && (n.is_power_of_two() || listed(n))
