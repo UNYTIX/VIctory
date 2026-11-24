@@ -296,6 +296,127 @@ pub(crate) fn dump_targets(frame: u64) {
     }
 }
 
+/// With `VICTORY_DUMP_TARGETS` set, buffers too: the title memory ranges
+/// the listed frames' shaders write through unordered access (a compute's
+/// output that later passes read), in first-use order. Each is logged as
+/// `uav buffer <i>` when first bound, so with the draw trace on, right
+/// after the draw or dispatch that first writes it (later writers of the
+/// same range are not logged again). At the frame's present its contents
+/// are summarized in the log (`uav buffer contents`) and, up to
+/// [`RAW_MAX`] bytes, saved as `frame-<n>-buf<i>-<address>-<len>.bin`.
+/// A frame listed by time is noted only from the moment it is listed; the
+/// frame after it is whole.
+static BUFFERS: std::sync::Mutex<Vec<NotedBuffer>> = std::sync::Mutex::new(Vec::new());
+
+/// A range a listed frame's shaders write: its host copy, address, length.
+type NotedBuffer = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+
+/// Ranges noted per frame at most (the world binds a few hundred).
+const NOTED_MAX: usize = 4096;
+/// Largest range saved as a file (the world also binds views of its whole
+/// heap, about 174 MB, which are only summarized).
+const RAW_MAX: u64 = 4 << 20;
+
+/// Notes a range of title memory the frame being built writes through
+/// unordered access.
+pub(crate) fn note_buffer(shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) {
+    if !dump_on() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    let mut buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    let noted = buffers
+        .iter()
+        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (address, len));
+    if noted || buffers.len() >= NOTED_MAX {
+        return;
+    }
+    tracing::info!(
+        i = buffers.len(),
+        address = format_args!("{address:#x}"),
+        len,
+        "uav buffer"
+    );
+    buffers.push((shadow.clone(), address, len));
+}
+
+/// At the present of frame `frame`: summarizes the noted buffers (every
+/// submission has run, so each copy holds what the shaders wrote).
+pub(crate) fn dump_buffers(frame: u64) {
+    let buffers = std::mem::take(&mut *BUFFERS.lock().unwrap_or_else(|e| e.into_inner()));
+    for (i, (shadow, address, len)) in buffers.iter().enumerate() {
+        let bytes = shadow.read(*address, *len);
+        let s = Stats::of(&bytes);
+        tracing::info!(
+            frame,
+            i,
+            address = format_args!("{address:#x}"),
+            len = bytes.len(),
+            dwords = s.dwords,
+            zero = s.zero,
+            nonfinite = s.nonfinite,
+            min = s.min,
+            max = s.max,
+            mean = s.mean,
+            "uav buffer contents{}",
+            if s.zero == s.dwords {
+                " (all zero)"
+            } else {
+                ""
+            }
+        );
+        if bytes.len() as u64 > RAW_MAX {
+            continue;
+        }
+        let Some(folder) = folder() else { return };
+        let name = format!("frame-{frame}-buf{i:03}-{address:#x}-{}.bin", bytes.len());
+        let path = folder.join(name);
+        if let Err(e) = std::fs::write(&path, &bytes) {
+            tracing::warn!(error = %e, path = %path.display(), "buffer not saved");
+        }
+    }
+}
+
+/// A buffer's contents in a few numbers, its dwords read as `f32` (the
+/// usual element of the buffers lighting reads).
+#[derive(Debug, Default, PartialEq)]
+struct Stats {
+    dwords: usize,
+    /// Dwords that are 0.
+    zero: usize,
+    /// Dwords that are NaN or infinite as floats.
+    nonfinite: usize,
+    /// Over the finite floats (0 when there are none).
+    min: f32,
+    max: f32,
+    mean: f64,
+}
+
+impl Stats {
+    fn of(bytes: &[u8]) -> Stats {
+        let mut s = Stats::default();
+        let (mut finite, mut sum) = (0usize, 0f64);
+        let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
+        for d in bytes.as_chunks::<4>().0 {
+            let bits = u32::from_le_bytes(*d);
+            let v = f32::from_bits(bits);
+            s.dwords += 1;
+            s.zero += usize::from(bits == 0);
+            if v.is_finite() {
+                finite += 1;
+                sum += f64::from(v);
+                min = min.min(v);
+                max = max.max(v);
+            } else {
+                s.nonfinite += 1;
+            }
+        }
+        if finite > 0 {
+            (s.min, s.max, s.mean) = (min, max, sum / finite as f64);
+        }
+        s
+    }
+}
+
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
@@ -570,8 +691,50 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::Stats;
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    fn bytes(dwords: &[u32]) -> Vec<u8> {
+        dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn an_empty_buffer_reads_as_all_zero() {
+        let s = Stats::of(&[0; 64]);
+        assert_eq!((s.dwords, s.zero, s.nonfinite), (16, 16, 0));
+        assert_eq!((s.min, s.max, s.mean), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn floats_are_summarized_and_nonfinite_ones_counted_apart() {
+        let s = Stats::of(&bytes(&[
+            1.5f32.to_bits(),
+            (-2.0f32).to_bits(),
+            0,
+            f32::NAN.to_bits(),
+            f32::INFINITY.to_bits(),
+            4.5f32.to_bits(),
+        ]));
+        let expected = Stats {
+            dwords: 6,
+            zero: 1,
+            nonfinite: 2,
+            min: -2.0,
+            max: 4.5,
+            mean: 1.0,
+        };
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn trailing_bytes_short_of_a_dword_are_left_out() {
+        let mut b = bytes(&[0x3f80_0000]); // 1.0
+        b.extend([0xff, 0xff]);
+        let s = Stats::of(&b);
+        assert_eq!((s.dwords, s.zero, s.max), (1, 0, 1.0));
     }
 }

@@ -121,6 +121,18 @@ impl Shadow {
         }
     }
 
+    /// The copy's bytes at `[address, address + len)`, cut to the buffer:
+    /// once a submission has run, what its shaders left there.
+    ///
+    /// shortcut: read without the submitting thread's ordering, so a
+    /// submission running meanwhile can tear what is read (diagnostics only).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn read(&self, address: u64, len: u64) -> Vec<u8> {
+        let (from, to) = self.inside(address as usize, len as usize);
+        // SAFETY: `inside` keeps the range within the persistent mapping.
+        unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) }.to_vec()
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
