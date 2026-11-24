@@ -2638,9 +2638,21 @@ impl<'a> Lower<'a> {
             // and pick lanes the host's way, so masks and lanes agree. Mesh
             // code reads no other lanes, so each host wave then acts as a
             // narrower console wave.
-            if self.x.native.wave64 && self.x.options.wave64 != Wave64Mode::Native {
+            // (Peppacodes ed9afc0, written for #189's `Wave64Mode`; here the
+            // host's narrower waves are `!target.runs(64)`.)
+            if self.x.native.wave64
+                && !self.x.target.runs(64)
+                && std::env::var_os("VICTORY_MESH_CONSOLE_LANES").is_none()
+            {
                 self.s.flags |= flags::WAVE_OPS;
-                return self.host_lane_index();
+                return self.s.op(
+                    self.cur,
+                    "waveGetLaneIndex",
+                    Attr::ReadOnly,
+                    self.s.t.i32,
+                    111,
+                    &[],
+                );
             }
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.

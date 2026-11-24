@@ -1312,6 +1312,8 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
     /// The spill rule reads root arguments as SGPRs 16 and up, so it applies
     /// only when the hardware puts nothing of its own there: with 16 user
     /// SGPRs, the thread-group id would land in s16.
