@@ -52,7 +52,9 @@ fn timed(n: u64) -> bool {
     let now = start.elapsed().as_secs_f64();
     if let Some(i) = left.iter().position(|&t| now >= t) {
         left.remove(i);
-        chosen.push(n);
+        // (asked first at a present, too late for that frame's targets: the next frame's are
+        // noted from its first draw)
+        chosen.extend([n, n + 1]);
         tracing::info!(frame = n, secs = now, "combo: frame listed for capture");
         return true;
     }
