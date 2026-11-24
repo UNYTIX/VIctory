@@ -3861,12 +3861,18 @@ impl<'a> Lower<'a> {
                 // A descriptor the program only reads through `s_buffer_load`
                 // is a raw buffer: the scalar load reads its bytes, not a
                 // resource. Its dwords 2/3 are the size, which the program may
-                // also read as data (see above).
+                // also read as data (see above). Only an SRV use comes here:
+                // `smem` reads such a load through a raw view for that kind and
+                // through a constant buffer for every other, so any other kind
+                // would describe this descriptor as a view the load never uses.
                 Fields::Smem { .. } if un.starts_with("s_buffer_load") => {
                     if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                         return Err("a constant buffer's descriptor read as data");
                     }
-                    ((11 | u, 0), None)
+                    if !used.is_some_and(|u| u.kind == ResourceType::Srv) {
+                        return Err("a scalar memory read as data");
+                    }
+                    ((11, 0), None)
                 }
                 _ => return Err("a scalar memory read as data"),
             };
