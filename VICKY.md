@@ -19,6 +19,10 @@ VIcky is a **research fork of [VIctory](https://github.com/Marvisak/VIctory)**. 
 | Mesh output bounds, every primitive initialised | integration update 6 (VIctory #587) |
 | An empty buffer view, or one that runs past its host copy, becomes a null view instead of removing the device | this fork |
 | `VICTORY_DUMP_FAILED_SHADERS=<folder>` keeps the containers of shaders that do not translate, for `victory shader-info --disasm`. They are title data: keep them local | this fork |
+| Root arguments the console spills to memory: compute programs whose root layout starts at user SGPR 16 read it through `s[0:1]`. This was the first cause of missing compute programs on NVIDIA here (34 programs → 1). | VIctory #302 + #489 (dadou000, louketa, Brazlucas), with `initialized_sgprs` from `main` |
+| Mask dwords at data joins, and `s_bcnt1`'s SCC of a mask | VIctory #878 (permadiego `7ab94ab`), ported by hand |
+| Wave64 mesh code numbers its lanes the host's way on 32-lane hosts | Peppacodes `ed9afc0` (VIctory #940), adapted to this tree's wave64 stack (`VICTORY_MESH_CONSOLE_LANES=1` turns it off) |
+| `VICTORY_SHOW_GBUFFER=<n>` presents G-buffer target `n` (default 1, the packed normals) instead of the title's black picture | this fork |
 
 ## Build and run
 
@@ -40,12 +44,37 @@ With `VICTORY_SHADER_LOOP_LIMIT=32`, testers report no device removal on several
   
   A program that has no host pipeline is marked `MISSING <reason>`; one that was left out is marked `SKIPPED`.
 
+More switches (diagnostics builds):
+
+- `VICTORY_SHOW_GBUFFER=1`: see the world's geometry live, in false colours.
+- `VICTORY_ADAPTER=<part of a name>`: run on another GPU. For example `radeon` selects an integrated AMD GPU, which has native 64-lane waves.
+- `VICTORY_HOST_LANES_MAX=32`: translate as for a 32-lane host on a GPU that has 64-lane waves. Combined with the previous switch, this gives an A/B of the wave64 emulation on one GPU and one driver.
+- `VICTORY_VIEW_HEAP_CAP=1000000`: cap the view heap as NVIDIA does, on a GPU that takes the whole heap.
+- `VICTORY_DEBUG_PSO=<hash>,…`: log a mesh pipeline's whole blend state and its target formats.
+- `VICTORY_DUMP_SHADERS=<folder>` (and `VICTORY_DUMP_SHADERS_ONLY=<hash>,…`): keep translated containers. They are title data: keep them local.
+- `VICTORY_TIME_CS=<file of record names>` with `victory translate --pipelines --jobs 1`: time the direct-DXIL path and the first driver compile, with the driver's cache off (needs Windows developer mode).
+
 ## What we know so far
 
 Measured on an RTX 4080 (Windows 11), in diagnostics builds of this tree, unless a line says otherwise.
 
 - **The world loads and runs at about 1 frame per second.** About 930–980 draws and dispatches per frame are dropped, of about 2,150; about 250 of those are only waiting for their pipelines to compile. The UI, subtitles and the loading art all render.
-- **Latest:** compute `f0afa89ecfb6944e` caused the long thin lines. Found by elimination over the 38 programs the guess unblocked: it read a 128-byte record with a guessed stride of 136, a size the shader declares for another resource. With the 16-byte rule, the lines are gone and there is no device removal in 4 min 40 s. About 2,550 draws per frame run and about 560 are dropped. The HDR / lighting targets are still black (issue #2).
+- **Latest (2026-11-24 evening):**
+  - **Spilled root arguments (VIctory #302/#489).** The first cause of missing compute programs on NVIDIA here was "an address in an SGPR that is no root parameter": 12 of the 15 most-dispatched missing computes in a traced world frame, at code offsets 0x2c–0x40. They read their root arguments through the spill table `s[0:1]` points to. With #302/#489, that class drops from 34 programs to 1, untranslated programs drop from 129 to 115, and dropped draws fall to about 200–650 per frame.
+  - **The G-buffer view shows real objects:** tables, lamps, a basketball hoop, plates, a phone, whole characters. Much of the scene is still missing, and a web of long thin lines remains on some views.
+  - **Albedo (G-buffer RT0, `R8G8B8A8_TYPELESS` viewed as sRGB) is exactly zero**, in every frame. These causes are ruled out, with evidence:
+    - a typeless RTV: the title gives typed formats;
+    - the sRGB export: exports always take the console's 32_ABGR patch;
+    - a dropped `SV_Target0`: it is stored;
+    - missing texture memory: only 81 all-zero reads;
+    - the view heap cap (below).
+
+    The opaque G-buffer shader writes RT0 with blending off. Each channel is a legacy multiply, `saturate(1 - texA.x) × texB.x × …`, so a zero sample in either factor gives exactly 0. The blended layers use `SRC_ALPHA / INV_SRC_ALPHA`, with alpha = `s26 × pow(tex, s6)`.
+  - **Native wave64 vs NVIDIA.** On the CPU's integrated Radeon (RDNA2, 32–64-lane waves, `VICTORY_ADAPTER=radeon`), the same build runs about 4,350–4,540 draws per frame, about what a private Linux/vkd3d build with a lit scene shows (4,519). The final picture there showed coloured light for the first time. On the RTX 4080 the same build runs 1,000–2,800 draws per frame. The iGPU runs out of memory for some pipelines and is very slow, so its picture stays partial.
+  - **NVIDIA's view heap cap is exactly 1,000,000.** A probe of `CreateDescriptorHeap` on the RTX 4080 accepted 1,000,000 and refused 1,048,576 and every size above. With 2^18 dynamic slots, 737,855 title slots remain, of the 1,245,184 the title asks for. "title slot past the host heap" never fired, so the title wrote no descriptor past that.
+  - **A tree on VIctory #189** (wave64 `Emulate`, multi-wave groups) **is worse than this one** on the RTX 4080. It had 673 untranslated programs against 115, 900–2,600 draws per frame, and a device removal at 2 min 18 s. It ran at 1.6–2.1 fps, but only because it ran less work.
+  - **`VICTORY_SHADER_LOOP_LIMIT=1024`** (as another tester uses) left about 1,900 pipelines compiling for four minutes on a cold cache. With 32 they compile in one to two minutes.
+- **Earlier:** compute `f0afa89ecfb6944e` caused the long thin lines. Found by elimination over the 38 programs the guess unblocked: it read a 128-byte record with a guessed stride of 136, a size the shader declares for another resource. With the 16-byte rule, the lines are gone and there is no device removal in 4 min 40 s. About 2,550 draws per frame run and about 560 are dropped. The HDR / lighting targets are still black (issue #2).
 - **Earlier (stride guess + view guard): instance culling runs.** Dropped draws went from ~950 to ~565 per frame, and about 2,550 now run. The G-buffer shows recognisable objects (a picnic table, a chair, a lamp, a basketball hoop). It is also crossed by long thin lines: triangles whose vertices fly off, so some meshes get wrong positions. That's next. No device removal in 5 minutes.
 - **Before that: the G-buffer was partly drawn.** In a world frame (a cutscene), the 2560x1440 G-buffer targets hold some geometry: curtains, a roof, plates, a light shaft. It is striped and noisy, and much of the scene is missing. The depth target matches.
 - **Every HDR / lighting target is black.** The post-process output is a flat colour, which is why the screen is grey. So the first link that breaks is lighting, right after the G-buffer.
