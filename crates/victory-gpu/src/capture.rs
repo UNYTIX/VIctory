@@ -465,8 +465,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
 /// about the 0.1st to the 99.9th; values outside saturate. Where that range is
 /// empty (most of the target 0, or all of it negative), the minimum to the
 /// maximum is used instead; a flat target is black at 0 or below and white
-/// above. Percentiles come from whole pixels, one per stride at a jittered
-/// place in it (so a stride cannot follow a column pattern), at most
+/// above. Percentiles come from whole pixels, one per stride at a hashed
+/// place in it (which makes following a column pattern unlikely), at most
 /// [`SAMPLES`] values (see [`sample_positions`]). Counts, maximum and mean
 /// cover every pixel's decoded channels: not a decoder's padding, nor the
 /// alpha of multichannel colour formats (an alpha-only format is decoded as
@@ -489,8 +489,8 @@ const SAMPLES: usize = 1 << 20;
 
 /// The pixels (of `len`, with `channels` values each) a [`Scale`] samples:
 /// at most `SAMPLES / channels` whole pixels, one per stride at a hashed
-/// place in it, so no stride lines up with a row's column pattern; the last
-/// stride may be partial and is sampled too.
+/// place in it, which makes lining up with a row's column pattern unlikely
+/// (not impossible); the last stride may be partial and is sampled too.
 fn sample_positions(len: usize, channels: usize) -> impl Iterator<Item = usize> {
     let pixels = (SAMPLES / channels.max(1)).max(1);
     let step = len.div_ceil(pixels).max(1);
@@ -757,6 +757,11 @@ mod scale_tests {
                 assert!(!at.is_empty());
             }
         }
+        // A partial last stride (349,525 pixels a stride of 3 apart, one
+        // left over) is sampled too: only one place in it.
+        let at: Vec<usize> = sample_positions(699_052, 3).collect();
+        assert_eq!(at.last(), Some(&699_051));
+        assert!(at.len() * 3 <= SAMPLES);
     }
 
     #[test]
