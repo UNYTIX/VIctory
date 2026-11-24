@@ -525,6 +525,26 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// Whether a DXGI format is typeless (the root of a multi-format family);
+/// from Xvania7's VIctory #876.
+pub(crate) fn is_typeless(format: u32) -> bool {
+    format
+        .checked_add(1)
+        .is_some_and(|next| family(format) == format && family(next) == format)
+}
+
+/// The first concrete (typed) format of a typeless format's family (itself if
+/// it is concrete); from Xvania7's VIctory #876.
+pub(crate) fn first_concrete(format: u32) -> u32 {
+    match format {
+        90 => 87, // B8G8R8A8_TYPELESS -> B8G8R8A8_UNORM
+        92 => 88, // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM
+        39 => 41, // R32_TYPELESS -> R32_FLOAT (40 is D32_FLOAT)
+        f if is_typeless(f) => f + 1,
+        f => f,
+    }
+}
+
 /// sRGB formats and their linear twins: 8-bit color, then BC1, BC2, BC3
 /// and BC7.
 pub(crate) const SRGB: [(u32, u32); 7] = [

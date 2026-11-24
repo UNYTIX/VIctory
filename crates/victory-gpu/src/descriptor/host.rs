@@ -889,8 +889,24 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    if view == 0 {
+    if view == 0 && format.is_none() {
         return !typeless;
+    }
+    // (Xvania7's typeless-view fix, VIctory #876, ported to this tree) a view
+    // of no format or a typeless one on a typeless texture: the host refuses
+    // typeless views, and the slot stayed null (black cutscenes and post-
+    // process, VIctory #850): the family's first concrete format
+    if typeless && (view == 0 || crate::resource::is_typeless(view)) {
+        let concrete = match d.Format {
+            // the view must name the depth or the stencil plane
+            DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_R24G8_TYPELESS => return false,
+            DXGI_FORMAT_R16_TYPELESS if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 => DXGI_FORMAT_R16_UNORM,
+            _ => DXGI_FORMAT(crate::resource::first_concrete(own) as i32),
+        };
+        if let Some(format) = format {
+            *format = concrete;
+        }
+        return true;
     }
     // A packed 16-bit target made R8G8B8A8_UNORM on this GPU
     // (`resource::target_format`): views name the format it has.
